@@ -375,8 +375,8 @@ const plugin = (() => {
         send(peerId, { type:'challenge', fromName: YM.profile.name, to: peerUuid });
         _YM.toast('👆 Défi envoyé à ' + pn + ' !');
         btn.textContent = '⏳ En attente…'; btn.disabled = true;
-        // Ouvrir la sphere directement pour voir l'état en attente
-        YM.openSphere(ID);
+        // Defer openSphere to avoid DOM mutation during onclick
+        setTimeout(() => YM.openSphere(ID), 50);
       };
       card.appendChild(btn);
       container.appendChild(card);
