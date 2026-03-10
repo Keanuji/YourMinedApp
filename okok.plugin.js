@@ -1,465 +1,385 @@
 /**
- * Autopartage — YourMine plugin
- * Conversations privées conducteur ↔ chaque passager.
- * Modèle: trip.convs = { [passengerUuid]: [{uuid,name,text,ts}] }
+ * YourMine Plugin — Tap Race v1.0
+ * Duel de tap P2P : qui tapera le plus vite en 10 secondes ?
+ * category: jeux
+ * website: https://github.com/theodoreyong9/YourMinedApp
  */
-const plugin = {
-  name: 'autopartage',
-  icon: '🚗',
-  description: 'Covoiturage pair-à-pair entre utilisateurs proches',
+const plugin = (() => {
+  const ID = 'jeux.tap-race';
+  const KEY = 'ym_taprace_';
 
-  _key: 'ym_plugin_autopartage',
-  _save(d) { try { localStorage.setItem(this._key, JSON.stringify(d)); } catch(e) {} },
-  _load()  { try { return JSON.parse(localStorage.getItem(this._key) || 'null'); } catch(e) { return null; } },
+  // ── State (in-memory) ──
+  let game    = null;   // { peerId, peerName, myScore, theirScore, phase, startTs, timerTO, cdIV }
+  let pending = null;   // { fromId, fromName }
+  let _YM     = null;
+  let _hubBound = false;
 
-  _cfg: null,
-  _trips: [],
-  _YM: null,
-  _container: null,
-  _broadcastTimer: null,
-  _view: null,  // null=list, {tripId, passengerUuid}=open conversation
+  function store(k, v) {
+    if (v === undefined) return JSON.parse(localStorage.getItem(KEY + k) || 'null');
+    localStorage.setItem(KEY + k, JSON.stringify(v));
+  }
 
-  render(container, YM) {
-    this._YM = YM;
-    this._container = container;
-    const saved = this._load() || {};
-    this._cfg   = saved.cfg   || null;
-    this._trips = saved.trips || [];
-    this._view  = null;
-    container.style.cssText = 'font-family:inherit;padding:0;display:flex;flex-direction:column;height:100%;';
-    if (YM.onHub) {
-      YM.onHub(data => {
-        if (data && data.autopartage) this._mergeTrip(data.autopartage);
-      });
-    }
-    this._renderMain();
-  },
+  function send(peerId, payload) {
+    _YM.sendTo(peerId, { plugin: ID, ...payload });
+  }
 
-  _mergeTrip(incoming) {
-    const idx = this._trips.findIndex(t => t.id === incoming.id);
-    if (idx >= 0) {
-      const ex = this._trips[idx];
-      const merged = Object.assign({}, ex.convs || {});
-      Object.entries(incoming.convs || {}).forEach(function(entry) {
-        const pUuid = entry[0];
-        const msgs  = entry[1];
-        const existing = merged[pUuid] || [];
-        const seen = new Set(existing.map(function(m) { return m.uuid + m.ts; }));
-        const fresh = msgs.filter(function(m) { return !seen.has(m.uuid + m.ts); });
-        merged[pUuid] = existing.concat(fresh).sort(function(a,b) { return a.ts - b.ts; });
-      });
-      Object.assign(ex, {
-        destination: incoming.destination,
-        seats:       incoming.seats,
-        driverPhoto: incoming.driverPhoto,
-        driverName:  incoming.driverName,
-        convs:       merged,
-      });
-    } else {
-      this._trips.unshift(incoming);
-    }
-    this._persist();
-    if (this._container && this._container.isConnected) {
-      if (this._view && this._view.tripId === incoming.id) {
-        this._renderConv(this._view.tripId, this._view.passengerUuid);
-      } else if (!this._view) {
-        this._renderMain();
+  function cleanGame() {
+    if (game?.timerTO) clearTimeout(game.timerTO);
+    if (game?.cdIV)    clearInterval(game.cdIV);
+    game = null;
+  }
+
+  function peerName(peerId) {
+    return _YM.peers.find(p => p.peerId === peerId)?.name || 'Pair';
+  }
+
+  // ── DM handler ──
+  function onMsg(data) {
+    if (data.plugin !== ID) return;
+    const myUuid = _YM.profile.uuid;
+    if (data.to && data.to !== myUuid) return;
+
+    if (data.type === 'challenge') {
+      if (game && game.phase !== 'result') {
+        send(data.from, { type: 'decline', to: data.from, reason: 'busy' });
+        return;
       }
-    }
-  },
-
-  _persist() { this._save({ cfg: this._cfg, trips: this._trips }); },
-
-  _renderMain() {
-    this._view = null;
-    const c = this._container;
-    c.innerHTML = '';
-    const bar = el('div', 'ap-bar');
-    bar.append(el('div', 'ap-title', '🚗 Autopartage'), btn('⚙', 'ap-cfg-btn', () => this._renderConfig()));
-    c.appendChild(bar);
-
-    const myUuid = (this._YM.profile && this._YM.profile.uuid) || 'local';
-    const myRole = this._cfg && this._cfg.role;
-
-    if (!myRole) {
-      c.appendChild(el('div', 'ap-hint', 'Configure ton rôle via ⚙ pour participer.'));
-      c.appendChild(styleBlock());
+      pending = { fromId: data.from, fromName: data.fromName || peerName(data.from) };
+      _YM.notify(ID);
+      _YM.toast('👆 Défi Tap Race de ' + pending.fromName + ' !');
+      rerender();
       return;
     }
 
-    if (myRole === 'driver') {
-      const myTrip = this._trips.find(function(t) { return t.id === 'trip-' + myUuid; });
-      if (!myTrip) {
-        c.appendChild(el('div', 'ap-hint', 'Sauvegarde ta config pour publier ton trajet.'));
-      } else {
-        const info = el('div', 'ap-trip-info');
-        info.innerHTML = '📍 <strong>' + esc(myTrip.destination || '?') + '</strong> · 💺 ' + (myTrip.seats||1) + ' place(s)';
-        c.appendChild(info);
-        const convs = myTrip.convs || {};
-        const pUuids = Object.keys(convs);
-        c.appendChild(el('div', 'ap-section-label', pUuids.length ? 'Conversations (' + pUuids.length + ')' : 'En attente de messages…'));
-        if (pUuids.length === 0) {
-          c.appendChild(el('div', 'ap-empty', 'Aucun passager ne t\'a encore écrit.'));
-        } else {
-          const self = this;
-          pUuids.forEach(function(pUuid) {
-            const msgs = convs[pUuid] || [];
-            const last = msgs[msgs.length - 1];
-            const near = self._YM.nearPeers && self._YM.nearPeers.find(function(e) { return e.uuid === pUuid; });
-            const pName  = (near && near.profile && near.profile.name) || (last && last.uuid !== myUuid && last.name) || 'Passager';
-            const pPhoto = (near && near.profile && near.profile.photo) || '';
-            c.appendChild(self._convRow(pUuid, pName, pPhoto, last, myUuid, function() {
-              self._renderConv(myTrip.id, pUuid);
-            }));
-          });
-        }
-      }
-    } else {
-      // passenger
-      const self = this;
-      const drivers = this._trips.filter(function(t) { return t.role === 'driver'; });
-      c.appendChild(el('div', 'ap-section-label', 'Conducteurs disponibles'));
-      if (drivers.length === 0) {
-        c.appendChild(el('div', 'ap-empty', 'Aucun conducteur pour l\'instant.'));
-      } else {
-        drivers.forEach(function(trip) {
-          const myConv = (trip.convs && trip.convs[myUuid]) || [];
-          const last = myConv[myConv.length - 1];
-          c.appendChild(self._driverRow(trip, last, myUuid, function() {
-            self._renderConv(trip.id, myUuid);
-          }));
-        });
-      }
+    if (data.type === 'accept') {
+      if (!game || game.phase !== 'waiting') return;
+      startCountdown();
+      return;
     }
 
-    clearInterval(this._broadcastTimer);
-    this._broadcastMyTrip();
-    const self = this;
-    this._broadcastTimer = setInterval(function() {
-      if (self._container && self._container.isConnected) self._broadcastMyTrip();
-      else clearInterval(self._broadcastTimer);
-    }, 15000);
-
-    c.appendChild(styleBlock());
-  },
-
-  _convRow(pUuid, pName, pPhoto, lastMsg, myUuid, onclick) {
-    const row = el('div', 'ap-conv-row');
-    row.style.cursor = 'pointer';
-    const avatar = el('div', 'ap-avatar');
-    if (pPhoto) {
-      const img = document.createElement('img');
-      img.src = pPhoto; img.style.cssText = 'width:100%;height:100%;object-fit:cover;border-radius:50%';
-      avatar.appendChild(img);
-    } else { avatar.textContent = (pName||'?')[0].toUpperCase(); }
-    const body = el('div', 'ap-conv-row-body');
-    body.appendChild(el('div', 'ap-conv-row-name', esc(pName)));
-    if (lastMsg) {
-      body.appendChild(el('div', 'ap-conv-row-preview', (lastMsg.uuid === myUuid ? 'Toi: ' : '') + esc(lastMsg.text).slice(0,50)));
-    }
-    row.append(avatar, body, el('div', 'ap-conv-row-arrow', '›'));
-    row.onclick = onclick;
-    return row;
-  },
-
-  _driverRow(trip, lastMsg, myUuid, onclick) {
-    const row = el('div', 'ap-conv-row');
-    row.style.cursor = 'pointer';
-    const avatar = el('div', 'ap-avatar');
-    if (trip.driverPhoto) {
-      const img = document.createElement('img');
-      img.src = trip.driverPhoto; img.style.cssText = 'width:100%;height:100%;object-fit:cover;border-radius:50%';
-      avatar.appendChild(img);
-    } else { avatar.textContent = (trip.driverName||'?')[0].toUpperCase(); }
-    const body = el('div', 'ap-conv-row-body');
-    body.appendChild(el('div', 'ap-conv-row-name', esc(trip.driverName || 'Anonyme')));
-    body.appendChild(el('div', 'ap-conv-row-preview', '📍 ' + esc(trip.destination||'?') + ' · 💺 ' + (trip.seats||'?')));
-    if (lastMsg) body.appendChild(el('div', 'ap-conv-row-preview', (lastMsg.uuid === myUuid ? 'Toi: ' : '') + esc(lastMsg.text).slice(0,40)));
-    row.append(avatar, body, el('div', 'ap-conv-row-arrow', '›'));
-    row.onclick = onclick;
-    return row;
-  },
-
-  _renderConv(tripId, passengerUuid) {
-    this._view = { tripId: tripId, passengerUuid: passengerUuid };
-    const c = this._container;
-    c.innerHTML = '';
-    const myUuid = (this._YM.profile && this._YM.profile.uuid) || 'local';
-    const myName = (this._YM.profile && this._YM.profile.name) || 'Anonyme';
-    const trip = this._trips.find(function(t) { return t.id === tripId; });
-    if (!trip) { this._renderMain(); return; }
-
-    const isDriver = myUuid === trip.driverUuid;
-    var otherUuid, otherName, otherPhoto;
-    if (isDriver) {
-      otherUuid = passengerUuid;
-      const near = this._YM.nearPeers && this._YM.nearPeers.find(function(e) { return e.uuid === passengerUuid; });
-      const msgs = (trip.convs && trip.convs[passengerUuid]) || [];
-      const firstFromOther = msgs.find(function(m) { return m.uuid !== myUuid; });
-      otherName  = (near && near.profile && near.profile.name) || (firstFromOther && firstFromOther.name) || 'Passager';
-      otherPhoto = (near && near.profile && near.profile.photo) || '';
-    } else {
-      otherUuid  = trip.driverUuid;
-      otherName  = trip.driverName || 'Conducteur';
-      otherPhoto = trip.driverPhoto || '';
-    }
-
-    // Header bar
-    const bar = el('div', 'ap-conv-bar');
-    const self = this;
-    bar.appendChild(btn('←', 'ap-back-btn', function() { self._renderMain(); }));
-    const head = el('div', 'ap-conv-head');
-    head.style.cursor = 'pointer';
-    head.onclick = function() {
-      const near = self._YM.nearPeers && self._YM.nearPeers.find(function(e) { return e.uuid === otherUuid; });
-      if (self._YM.openProfile) self._YM.openProfile(otherUuid,
-        (near && near.profile) || { name: otherName, photo: otherPhoto, networks: [], plugins: [] },
-        near || null);
-    };
-    const avatarSm = el('div', 'ap-avatar-sm');
-    if (otherPhoto) {
-      const img = document.createElement('img');
-      img.src = otherPhoto; img.style.cssText = 'width:100%;height:100%;object-fit:cover;border-radius:50%';
-      avatarSm.appendChild(img);
-    } else { avatarSm.textContent = (otherName||'?')[0].toUpperCase(); }
-    const headInfo = el('div', 'ap-conv-head-info');
-    headInfo.appendChild(el('div', 'ap-conv-head-name', esc(otherName)));
-    headInfo.appendChild(el('div', 'ap-conv-head-sub',
-      isDriver ? '👤 Passager' : '📍 ' + esc(trip.destination||'?') + ' · 💺 ' + (trip.seats||'?')));
-    head.append(avatarSm, headInfo);
-    bar.appendChild(head);
-    c.appendChild(bar);
-
-    // Messages area
-    const convWrap = el('div', 'ap-conv-wrap');
-    const renderMsgs = function() {
-      convWrap.innerHTML = '';
-      const msgs = (trip.convs && trip.convs[passengerUuid]) || [];
-      if (msgs.length === 0) {
-        convWrap.appendChild(el('div', 'ap-no-msg', 'Pas encore de messages. Dis bonjour !'));
-      } else {
-        msgs.forEach(function(m) {
-          const row = el('div', 'ap-msg' + (m.uuid === myUuid ? ' ap-msg-me' : ''));
-          row.innerHTML = '<span class="ap-msg-name">' + esc(m.name) + '</span><span class="ap-msg-text">' + esc(m.text) + '</span>';
-          convWrap.appendChild(row);
-        });
-        convWrap.scrollTop = convWrap.scrollHeight;
+    if (data.type === 'decline') {
+      if (game) {
+        const n = game.peerName;
+        cleanGame();
+        _YM.toast('👆 ' + n + (data.reason === 'busy' ? ' est déjà en partie.' : ' a refusé.'));
+        rerender();
       }
-    };
-    renderMsgs();
-    c.appendChild(convWrap);
+      return;
+    }
 
-    // Input
-    const inputRow = el('div', 'ap-input-row');
-    const input = document.createElement('input');
-    input.type = 'text'; input.placeholder = 'Message…'; input.className = 'ap-input';
-    const sendFn = function() {
-      const txt = input.value.trim(); if (!txt) return;
-      if (!trip.convs) trip.convs = {};
-      if (!trip.convs[passengerUuid]) trip.convs[passengerUuid] = [];
-      trip.convs[passengerUuid].push({ uuid: myUuid, name: myName, text: txt, ts: Date.now() });
-      self._persist();
-      self._broadcastTrip(trip);
-      input.value = '';
-      renderMsgs();
-      input.focus();
-    };
-    input.addEventListener('keydown', function(e) { if (e.key === 'Enter') sendFn(); });
-    inputRow.append(input, btn('↑', 'ap-send-btn', sendFn));
-    c.appendChild(inputRow);
-    c.appendChild(styleBlock());
-  },
+    if (data.type === 'tap') {
+      if (game?.phase === 'playing') {
+        game.theirScore = data.score;
+        const el = document.getElementById('tr-their-score');
+        if (el) el.textContent = game.theirScore;
+      }
+      return;
+    }
 
-  _renderConfig() {
-    const c = this._container;
-    c.innerHTML = '';
-    const cfg = Object.assign({ role: 'passenger', destination: '', seats: 2, photo: '' }, this._cfg || {});
-    const wrap = el('div', 'ap-config-wrap');
-    const self = this;
+    if (data.type === 'result') {
+      if (game?.phase === 'playing') {
+        game.theirScore = data.score;
+        endGame();
+      }
+      return;
+    }
+  }
 
-    wrap.appendChild(btn('← Retour', 'ap-back-btn', function() { self._renderMain(); }));
-    wrap.appendChild(el('div', 'ap-config-title', 'Configuration'));
+  // ── Game logic ──
+  function startCountdown() {
+    if (!game) return;
+    game.phase = 'countdown';
+    game.countdownVal = 3;
+    rerender();
+    game.cdIV = setInterval(() => {
+      if (!game) return;
+      game.countdownVal--;
+      rerender();
+      if (game.countdownVal <= 0) {
+        clearInterval(game.cdIV); game.cdIV = null;
+        startPlaying();
+      }
+    }, 1000);
+  }
 
-    // Role
-    const roleGroup = el('div', 'ap-field-group');
-    roleGroup.appendChild(el('label', 'ap-label', 'Rôle'));
-    const roleRow = el('div', 'ap-role-row');
-    const seatsGroup = el('div', 'ap-field-group');
-    seatsGroup.style.display = cfg.role === 'driver' ? '' : 'none';
-    const mkRole = function(val, label) {
-      const b = btn(label, 'ap-role-btn' + (cfg.role === val ? ' active' : ''), function() {
-        cfg.role = val;
-        wrap.querySelectorAll('.ap-role-btn').forEach(function(x) { x.classList.remove('active'); });
-        b.classList.add('active');
-        seatsGroup.style.display = val === 'driver' ? '' : 'none';
-      });
-      return b;
-    };
-    roleRow.append(mkRole('driver', '🧑‍✈️ Conducteur'), mkRole('passenger', '🙋 Conduit'));
-    roleGroup.appendChild(roleRow);
-    wrap.appendChild(roleGroup);
+  function startPlaying() {
+    if (!game) return;
+    game.phase = 'playing';
+    game.myScore = 0; game.theirScore = 0;
+    game.startTs = Date.now();
+    rerender();
+    game.timerTO = setTimeout(() => {
+      if (!game || game.phase !== 'playing') return;
+      send(game.peerId, { type: 'result', score: game.myScore, to: game.peerUuid });
+      endGame();
+    }, 10000);
+  }
 
-    // Destination
-    const destGroup = el('div', 'ap-field-group');
-    destGroup.appendChild(el('label', 'ap-label', 'Destination'));
-    const destInput = document.createElement('input');
-    destInput.type = 'text'; destInput.className = 'ap-field-input';
-    destInput.placeholder = 'Ex: Gare de Lyon'; destInput.value = cfg.destination || '';
-    destGroup.appendChild(destInput);
-    wrap.appendChild(destGroup);
+  function endGame() {
+    if (!game) return;
+    if (game.timerTO) { clearTimeout(game.timerTO); game.timerTO = null; }
+    if (game.cdIV)    { clearInterval(game.cdIV); game.cdIV = null; }
+    game.phase = 'result';
+    const won  = game.myScore > game.theirScore;
+    const draw = game.myScore === game.theirScore;
+    const hist = store('history') || [];
+    hist.unshift({ peerName: game.peerName, myScore: game.myScore, theirScore: game.theirScore,
+                   result: draw ? 'draw' : (won ? 'win' : 'lose'), ts: Date.now() });
+    if (hist.length > 30) hist.length = 30;
+    store('history', hist);
+    rerender();
+  }
 
-    // Seats
-    seatsGroup.appendChild(el('label', 'ap-label', 'Places disponibles'));
-    const seatsInput = document.createElement('input');
-    seatsInput.type = 'number'; seatsInput.className = 'ap-field-input';
-    seatsInput.min = 1; seatsInput.max = 8; seatsInput.value = cfg.seats || 2;
-    seatsGroup.appendChild(seatsInput);
-    wrap.appendChild(seatsGroup);
+  // ── Rerender helper ──
+  let _container = null;
+  let _activeTab = 'game';
+  function rerender() {
+    if (_container) renderInto(_container);
+  }
 
-    // Photo
-    const photoGroup = el('div', 'ap-field-group');
-    photoGroup.appendChild(el('label', 'ap-label', 'Photo (optionnel)'));
-    const photoRow = el('div', 'ap-photo-row');
-    const photoPreview = el('div', 'ap-photo-preview');
-    const showPreview = function(src) {
-      photoPreview.innerHTML = '';
-      if (src) {
-        const img = document.createElement('img');
-        img.src = src; img.style.cssText = 'width:100%;height:100%;object-fit:cover;border-radius:50%';
-        photoPreview.appendChild(img);
-      } else { photoPreview.textContent = '👤'; }
-    };
-    showPreview(cfg.photo);
-    const photoInput = document.createElement('input');
-    photoInput.type = 'file'; photoInput.accept = 'image/*'; photoInput.style.display = 'none';
-    photoInput.onchange = function() {
-      const file = photoInput.files[0]; if (!file) return;
-      const reader = new FileReader();
-      reader.onload = function(ev) {
-        const img = new Image();
-        img.onload = function() {
-          const canvas = document.createElement('canvas');
-          canvas.width = 80; canvas.height = 80;
-          canvas.getContext('2d').drawImage(img, 0, 0, 80, 80);
-          cfg.photo = canvas.toDataURL('image/jpeg', 0.75);
-          showPreview(cfg.photo);
-        };
-        img.src = ev.target.result;
+  // ── Render tabs ──
+  function renderInto(container) {
+    _container = container;
+    container.innerHTML = '';
+
+    // Tab bar
+    const tabs = [['game', '👆 Jeu'], ['scores', '🏆 Scores']];
+    const tabBar = document.createElement('div');
+    tabBar.style.cssText = 'display:flex;border-bottom:1px solid var(--border);margin-bottom:0';
+    tabs.forEach(([id, label]) => {
+      const btn = document.createElement('button');
+      btn.style.cssText = `flex:1;padding:10px;font-size:.76rem;background:none;border:none;cursor:pointer;color:${_activeTab===id?'var(--accent)':'var(--text-2)'};border-bottom:2px solid ${_activeTab===id?'var(--accent)':'transparent'};font-weight:${_activeTab===id?'700':'400'}`;
+      btn.textContent = label;
+      btn.onclick = () => { _activeTab = id; rerender(); };
+      tabBar.appendChild(btn);
+    });
+    container.appendChild(tabBar);
+
+    const body = document.createElement('div');
+    body.style.cssText = 'padding:0';
+    container.appendChild(body);
+
+    if (_activeTab === 'game') renderGame(body);
+    else renderScores(body);
+  }
+
+  function renderGame(c) {
+    // Pending invite
+    if (pending) {
+      const w = document.createElement('div');
+      w.style.cssText = 'padding:28px 16px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:12px';
+      const av = document.createElement('div');
+      av.style.cssText = 'width:72px;height:72px;border-radius:50%;background:rgba(255,107,53,.15);border:3px solid rgba(255,107,53,.5);display:flex;align-items:center;justify-content:center;font-size:2rem;font-family:var(--font-mono);font-weight:700;color:#ff6b35';
+      av.textContent = (pending.fromName[0] || '?').toUpperCase();
+      const msg = document.createElement('div');
+      msg.style.cssText = 'font-size:.9rem;color:var(--text-1);line-height:1.6';
+      msg.innerHTML = `<strong style="color:#ff6b35">${pending.fromName}</strong> vous défie !<br><span style="font-size:.68rem;color:var(--text-2)">10 secondes · qui tapera le plus vite ?</span>`;
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:8px';
+      const yes = document.createElement('button');
+      yes.className = 'btn-accent'; yes.textContent = '✔ Accepter'; yes.style.flex = '1';
+      yes.onclick = () => {
+        const pid = pending.fromId; const pn = pending.fromName;
+        game = { peerId: pid, peerName: pn, peerUuid: _YM.peers.find(p=>p.peerId===pid)?.uuid, myScore:0, theirScore:0, phase:'countdown', countdownVal:3, timerTO:null, cdIV:null };
+        pending = null;
+        send(pid, { type:'accept', to: game.peerUuid });
+        startCountdown();
       };
-      reader.readAsDataURL(file);
-    };
-    photoRow.append(photoPreview, btn('Choisir photo', 'ap-upload-btn', function() { photoInput.click(); }), photoInput);
-    photoGroup.appendChild(photoRow);
-    wrap.appendChild(photoGroup);
+      const no = document.createElement('button');
+      no.className = 'btn-secondary'; no.textContent = '✕ Refuser'; no.style.flex = '1';
+      no.onclick = () => {
+        send(pending.fromId, { type:'decline', to: _YM.peers.find(p=>p.peerId===pending.fromId)?.uuid });
+        pending = null; rerender();
+      };
+      row.appendChild(yes); row.appendChild(no);
+      w.appendChild(av); w.appendChild(msg); w.appendChild(row);
+      c.appendChild(w); return;
+    }
 
-    // Save
-    wrap.appendChild(btn('Enregistrer', 'ap-save-btn', function() {
-      cfg.destination = destInput.value.trim();
-      cfg.seats = parseInt(seatsInput.value) || 2;
-      self._cfg = cfg;
-      const myUuid = (self._YM.profile && self._YM.profile.uuid) || 'local';
-      const existing = self._trips.find(function(t) { return t.id === 'trip-' + myUuid; });
-      const myTrip = existing || { id: 'trip-' + myUuid, convs: {} };
-      Object.assign(myTrip, {
-        role:        cfg.role,
-        driverUuid:  myUuid,
-        driverName:  (self._YM.profile && self._YM.profile.name) || 'Anonyme',
-        driverPhoto: cfg.photo || (self._YM.profile && (self._YM.profile.photoHub || self._YM.profile.photo)) || '',
-        destination: cfg.destination,
-        seats:       cfg.seats,
-        timestamp:   Date.now(),
-      });
-      if (!myTrip.convs) myTrip.convs = {};
-      if (!existing) self._trips.unshift(myTrip);
-      self._persist();
-      self._broadcastMyTrip();
-      self._renderMain();
-    }));
+    if (!game) {
+      // Idle
+      const w = document.createElement('div');
+      w.style.cssText = 'text-align:center;padding:40px 20px;color:var(--text-2);font-size:.8rem;line-height:1.9';
+      w.innerHTML = '<div style="font-size:2.8rem;margin-bottom:10px">👆</div>Visitez un profil et tapez sur<br><strong style="color:#ff6b35">👆 Tap Race</strong> pour défier !';
+      c.appendChild(w); return;
+    }
 
-    c.append(wrap, styleBlock());
-  },
+    if (game.phase === 'waiting') {
+      const w = document.createElement('div');
+      w.style.cssText = 'padding:32px 16px;text-align:center;color:var(--text-2);font-size:.8rem;line-height:1.8';
+      w.innerHTML = `<div style="font-size:2rem;margin-bottom:10px">⏳</div>En attente que <strong style="color:var(--accent)">${game.peerName}</strong><br>accepte le défi…`;
+      const cancel = document.createElement('button');
+      cancel.className = 'btn-secondary'; cancel.style.cssText = 'margin-top:14px;font-size:.7rem';
+      cancel.textContent = '✕ Annuler';
+      cancel.onclick = () => {
+        send(game.peerId, { type:'decline', to: game.peerUuid });
+        cleanGame(); rerender();
+      };
+      w.appendChild(cancel); c.appendChild(w); return;
+    }
 
-  _broadcastMyTrip() {
-    if (!this._cfg) return;
-    const myUuid = (this._YM.profile && this._YM.profile.uuid) || 'local';
-    const t = this._trips.find(function(t) { return t.id === 'trip-' + myUuid; });
-    if (t) this._broadcastTrip(t);
-  },
+    if (game.phase === 'countdown') {
+      const w = document.createElement('div');
+      w.style.cssText = 'padding:32px 16px;text-align:center';
+      w.innerHTML = `<div style="font-size:6rem;font-family:var(--font-mono);font-weight:700;color:#ff6b35;line-height:1">${game.countdownVal}</div><div style="font-size:.76rem;color:var(--text-2);margin-top:10px">vs ${game.peerName} · Préparez-vous !</div>`;
+      c.appendChild(w); return;
+    }
 
-  _broadcastTrip(trip) {
-    try { this._YM.broadcast({ autopartage: trip }); } catch(e) {}
-  },
-};
+    if (game.phase === 'playing') {
+      const elapsed = Math.max(0, Math.min(1, (Date.now() - game.startTs) / 10000));
+      const scores = document.createElement('div');
+      scores.style.cssText = 'display:flex;justify-content:space-around;padding:14px 16px 6px;font-family:var(--font-mono)';
+      scores.innerHTML = `<div style="text-align:center"><div style="font-size:.6rem;color:var(--accent);text-transform:uppercase;margin-bottom:2px">Vous</div><div id="tr-my-score" style="font-size:2.8rem;font-weight:700;color:var(--accent)">${game.myScore}</div></div><div style="align-self:center;color:var(--text-3);font-size:.85rem">vs</div><div style="text-align:center"><div style="font-size:.6rem;color:var(--accent-2,#7c4dff);text-transform:uppercase;margin-bottom:2px">${game.peerName}</div><div id="tr-their-score" style="font-size:2.8rem;font-weight:700;color:var(--accent-2,#7c4dff)">${game.theirScore}</div></div>`;
+      c.appendChild(scores);
 
-function el(tag, cls, txt) {
-  const e = document.createElement(tag);
-  if (cls) e.className = cls;
-  if (txt !== undefined) e.textContent = txt;
-  return e;
-}
-function btn(label, cls, onclick) {
-  const b = document.createElement('button');
-  b.className = cls; b.textContent = label;
-  b.addEventListener('click', onclick);
-  return b;
-}
-function esc(s) {
-  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
+      const barWrap = document.createElement('div');
+      barWrap.style.cssText = 'margin:4px 16px 10px;height:5px;background:var(--border);border-radius:4px;overflow:hidden';
+      const barFill = document.createElement('div');
+      barFill.id = 'tr-timer-bar';
+      barFill.style.cssText = `height:100%;width:${Math.round((1-elapsed)*100)}%;background:#ff6b35;border-radius:4px;transition:width .25s linear`;
+      barWrap.appendChild(barFill); c.appendChild(barWrap);
 
-const _STYLE_ID = 'ap-styles';
-function styleBlock() {
-  if (document.getElementById(_STYLE_ID)) return document.createComment('ap-styles-ok');
-  const s = document.createElement('style');
-  s.id = _STYLE_ID;
-  s.textContent = `
-  .ap-bar { display:flex; align-items:center; justify-content:space-between; padding:14px 16px 8px; flex-shrink:0; }
-  .ap-title { font-size:1.1rem; font-weight:700; }
-  .ap-cfg-btn { background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.14); border-radius:20px; padding:6px 14px; font-size:.82rem; cursor:pointer; color:inherit; }
-  .ap-hint { padding:16px; font-size:.84rem; color:rgba(255,255,255,.45); font-style:italic; }
-  .ap-section-label { padding:6px 16px 4px; font-size:.7rem; text-transform:uppercase; letter-spacing:.07em; color:rgba(255,255,255,.4); flex-shrink:0; }
-  .ap-empty { padding:20px 16px; text-align:center; color:rgba(255,255,255,.35); font-size:.85rem; }
-  .ap-trip-info { padding:8px 16px 4px; font-size:.84rem; color:rgba(255,255,255,.6); flex-shrink:0; }
-  .ap-conv-row { display:flex; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid rgba(255,255,255,.06); cursor:pointer; }
-  .ap-conv-row:hover { background:rgba(255,255,255,.04); }
-  .ap-avatar { width:44px; height:44px; border-radius:50%; background:rgba(255,255,255,.12); display:flex; align-items:center; justify-content:center; font-size:1.2rem; flex-shrink:0; overflow:hidden; }
-  .ap-conv-row-body { flex:1; min-width:0; }
-  .ap-conv-row-name { font-weight:600; font-size:.92rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .ap-conv-row-preview { font-size:.78rem; color:rgba(255,255,255,.45); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:2px; }
-  .ap-conv-row-arrow { color:rgba(255,255,255,.3); font-size:1.4rem; flex-shrink:0; }
-  .ap-conv-bar { display:flex; align-items:center; gap:10px; padding:10px 16px; border-bottom:1px solid rgba(255,255,255,.08); flex-shrink:0; }
-  .ap-back-btn { background:none; border:none; color:rgba(255,255,255,.6); cursor:pointer; font-size:1.1rem; padding:0 6px; flex-shrink:0; }
-  .ap-conv-head { display:flex; align-items:center; gap:10px; flex:1; min-width:0; cursor:pointer; }
-  .ap-avatar-sm { width:36px; height:36px; border-radius:50%; background:rgba(255,255,255,.12); display:flex; align-items:center; justify-content:center; font-size:1rem; flex-shrink:0; overflow:hidden; }
-  .ap-conv-head-info { min-width:0; }
-  .ap-conv-head-name { font-weight:600; font-size:.9rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .ap-conv-head-sub { font-size:.74rem; color:rgba(255,255,255,.5); }
-  .ap-conv-wrap { flex:1; overflow-y:auto; padding:12px 16px; display:flex; flex-direction:column; gap:8px; min-height:0; }
-  .ap-no-msg { font-size:.8rem; color:rgba(255,255,255,.3); text-align:center; padding:20px 0; }
-  .ap-msg { display:flex; flex-direction:column; align-self:flex-start; max-width:78%; }
-  .ap-msg-me { align-self:flex-end; align-items:flex-end; }
-  .ap-msg-name { font-size:.67rem; color:rgba(255,255,255,.4); margin-bottom:2px; }
-  .ap-msg-text { background:rgba(255,255,255,.1); border-radius:14px; padding:7px 12px; font-size:.84rem; line-height:1.4; }
-  .ap-msg-me .ap-msg-text { background:rgba(99,179,237,.28); }
-  .ap-input-row { display:flex; gap:8px; padding:8px 12px 14px; border-top:1px solid rgba(255,255,255,.07); flex-shrink:0; }
-  .ap-input { flex:1; background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.12); border-radius:22px; padding:8px 16px; font-size:.84rem; color:inherit; outline:none; }
-  .ap-input:focus { border-color:rgba(99,179,237,.5); }
-  .ap-send-btn { background:rgba(99,179,237,.2); border:1px solid rgba(99,179,237,.4); border-radius:22px; padding:8px 16px; font-size:.84rem; cursor:pointer; color:inherit; }
-  .ap-send-btn:hover { background:rgba(99,179,237,.35); }
-  .ap-config-wrap { padding:12px 16px 24px; display:flex; flex-direction:column; gap:14px; overflow-y:auto; }
-  .ap-config-title { font-size:1rem; font-weight:700; text-align:center; }
-  .ap-field-group { display:flex; flex-direction:column; gap:6px; }
-  .ap-label { font-size:.75rem; color:rgba(255,255,255,.5); text-transform:uppercase; letter-spacing:.05em; }
-  .ap-field-input { background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.14); border-radius:10px; padding:9px 13px; font-size:.88rem; color:inherit; outline:none; width:100%; box-sizing:border-box; }
-  .ap-field-input:focus { border-color:rgba(99,179,237,.5); }
-  .ap-role-row { display:flex; gap:8px; }
-  .ap-role-btn { flex:1; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.12); border-radius:10px; padding:10px; cursor:pointer; font-size:.88rem; color:inherit; }
-  .ap-role-btn.active { background:rgba(99,179,237,.2); border-color:rgba(99,179,237,.5); }
-  .ap-photo-row { display:flex; align-items:center; gap:12px; }
-  .ap-photo-preview { width:52px; height:52px; border-radius:50%; background:rgba(255,255,255,.1); display:flex; align-items:center; justify-content:center; font-size:1.5rem; overflow:hidden; flex-shrink:0; }
-  .ap-upload-btn { background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.14); border-radius:10px; padding:8px 14px; font-size:.82rem; cursor:pointer; color:inherit; }
-  .ap-save-btn { background:rgba(99,179,237,.25); border:1px solid rgba(99,179,237,.45); border-radius:12px; padding:12px; font-size:.92rem; font-weight:600; cursor:pointer; color:inherit; width:100%; }
-  .ap-save-btn:hover { background:rgba(99,179,237,.4); }
-  `;
-  return s;
-}
+      const barInterval = setInterval(() => {
+        const b = document.getElementById('tr-timer-bar');
+        if (!b || !game || game.phase !== 'playing') { clearInterval(barInterval); return; }
+        const e2 = Math.max(0, Math.min(1, (Date.now() - game.startTs) / 10000));
+        b.style.width = Math.round((1-e2)*100) + '%';
+      }, 250);
+
+      const tapArea = document.createElement('div');
+      tapArea.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:10px;padding:8px 16px 18px';
+      const hint = document.createElement('div');
+      hint.style.cssText = 'font-size:.62rem;color:var(--text-3);font-family:var(--font-mono)';
+      hint.textContent = '↓ Tapez le cercle !';
+      tapArea.appendChild(hint);
+
+      const tapBtn = document.createElement('div');
+      tapBtn.style.cssText = 'width:130px;height:130px;border-radius:50%;background:rgba(255,107,53,.12);border:4px solid #ff6b35;cursor:pointer;box-shadow:0 0 32px rgba(255,107,53,.4);display:flex;align-items:center;justify-content:center;font-size:2.5rem;user-select:none;-webkit-user-select:none;touch-action:manipulation;transition:transform .06s,box-shadow .06s';
+      tapBtn.textContent = '👆';
+
+      const doTap = (e) => {
+        e.preventDefault(); e.stopPropagation();
+        if (!game || game.phase !== 'playing') return;
+        game.myScore++;
+        const ms = document.getElementById('tr-my-score');
+        if (ms) ms.textContent = game.myScore;
+        tapBtn.style.transform = 'scale(.82)';
+        tapBtn.style.boxShadow = '0 0 60px rgba(255,107,53,.9)';
+        setTimeout(() => { if(tapBtn) { tapBtn.style.transform = ''; tapBtn.style.boxShadow = '0 0 32px rgba(255,107,53,.4)'; } }, 70);
+        send(game.peerId, { type:'tap', score: game.myScore, to: game.peerUuid });
+      };
+      tapBtn.addEventListener('pointerdown', doTap);
+      tapArea.appendChild(tapBtn);
+      c.appendChild(tapArea);
+      return;
+    }
+
+    if (game.phase === 'result') {
+      const won  = game.myScore > game.theirScore;
+      const draw = game.myScore === game.theirScore;
+      const emoji = draw ? '🤝' : (won ? '🏆' : '😅');
+      const label = draw ? 'ÉGALITÉ !' : (won ? 'VICTOIRE !' : 'DÉFAITE');
+      const col   = draw ? 'var(--text-1)' : (won ? 'var(--accent)' : '#ff6b35');
+      const savedPid = game.peerId; const savedName = game.peerName; const savedUuid = game.peerUuid;
+      const w = document.createElement('div');
+      w.style.cssText = 'padding:20px 16px;display:flex;flex-direction:column;align-items:center;gap:12px';
+      w.innerHTML = `<div style="font-size:3.5rem">${emoji}</div><div style="font-size:1.1rem;font-weight:800;color:${col};font-family:var(--font-mono)">${label}</div><div style="display:flex;justify-content:space-around;width:100%;font-family:var(--font-mono)"><div style="text-align:center"><div style="font-size:.58rem;color:var(--accent);text-transform:uppercase">Vous</div><div style="font-size:2.2rem;font-weight:700;color:var(--accent)">${game.myScore}</div></div><div style="align-self:center;color:var(--text-3)">vs</div><div style="text-align:center"><div style="font-size:.58rem;color:var(--accent-2,#7c4dff);text-transform:uppercase">${game.peerName}</div><div style="font-size:2.2rem;font-weight:700;color:var(--accent-2,#7c4dff)">${game.theirScore}</div></div></div>`;
+      const btnRow = document.createElement('div');
+      btnRow.style.cssText = 'display:flex;gap:10px';
+      const again = document.createElement('button');
+      again.className = 'btn-accent'; again.textContent = '👆 Rejouer'; again.style.flex = '1';
+      again.onclick = () => {
+        game = { peerId: savedPid, peerName: savedName, peerUuid: savedUuid, myScore:0, theirScore:0, phase:'waiting', timerTO:null, cdIV:null };
+        send(savedPid, { type:'challenge', fromName: _YM.profile.name, to: savedUuid });
+        _YM.toast('👆 Nouveau défi envoyé !');
+        rerender();
+      };
+      const close = document.createElement('button');
+      close.className = 'btn-secondary'; close.textContent = 'Fermer'; close.style.flex = '1';
+      close.onclick = () => { cleanGame(); rerender(); };
+      btnRow.appendChild(again); btnRow.appendChild(close);
+      w.appendChild(btnRow);
+      c.appendChild(w);
+    }
+  }
+
+  function renderScores(c) {
+    const hist = store('history') || [];
+    if (!hist.length) {
+      c.innerHTML = '<div style="text-align:center;padding:36px 20px;color:var(--text-2);font-size:.8rem"><div style="font-size:2rem;opacity:.2;margin-bottom:8px">🏆</div>Aucune partie jouée.</div>';
+      return;
+    }
+    const stats = hist.reduce((a,h) => { a[h.result]=(a[h.result]||0)+1; return a; }, {});
+    const banner = document.createElement('div');
+    banner.style.cssText = 'display:flex;gap:0;border-bottom:1px solid var(--border)';
+    [['🏆', stats.win||0, 'var(--accent)'], ['🤝', stats.draw||0, 'var(--text-2)'], ['😅', stats.lose||0, '#ff6b35']].forEach(([e,n,col],i) => {
+      const cell = document.createElement('div');
+      cell.style.cssText = `flex:1;text-align:center;padding:14px 4px;${i<2?'border-right:1px solid var(--border)':''}`;
+      cell.innerHTML = `<div style="font-size:1rem">${e}</div><div style="font-size:1.5rem;font-weight:700;font-family:var(--font-mono);color:${col}">${n}</div>`;
+      banner.appendChild(cell);
+    });
+    c.appendChild(banner);
+    hist.slice(0,20).forEach(h => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:7px 14px;border-bottom:1px solid var(--border)';
+      const col = h.result==='win'?'var(--accent)':h.result==='draw'?'var(--text-1)':'#ff6b35';
+      row.innerHTML = `<span style="font-size:.9rem">${h.result==='win'?'🏆':h.result==='draw'?'🤝':'😅'}</span><span style="flex:1;font-size:.74rem;color:var(--text-1)">${h.peerName}</span><span style="font-family:var(--font-mono);font-size:.72rem;color:${col}">${h.myScore} – ${h.theirScore}</span><span style="font-size:.6rem;color:var(--text-3);margin-left:6px">${new Date(h.ts).toLocaleDateString('fr-FR',{day:'2-digit',month:'2-digit'})}</span>`;
+      c.appendChild(row);
+    });
+    const rst = document.createElement('button');
+    rst.className = 'btn-secondary'; rst.style.cssText = 'font-size:.65rem;margin:10px 14px;width:calc(100% - 28px)';
+    rst.textContent = '↺ Remettre à zéro';
+    rst.onclick = () => { if (confirm('Remettre à zéro ?')) { localStorage.removeItem(KEY+'history'); rerender(); } };
+    c.appendChild(rst);
+  }
+
+  return {
+    name: 'jeux.tap-race',
+    icon: '👆',
+    description: 'Duel de tap P2P : tapez le plus vite en 10 secondes !',
+
+    // Called at app startup to register background listener (receive challenges when sphere is closed)
+    init(YM) {
+      _YM = YM;
+      if (YM.onData) YM.onData(ID, onMsg);
+    },
+
+    render(container, YM) {
+      _YM = YM;
+      if (!_hubBound) {
+        YM.onHub(onMsg);
+        _hubBound = true;
+      }
+      // Background listener: receive challenges even when sphere is closed
+      if (YM.onData) YM.onData(ID, onMsg);
+      _activeTab = 'game';
+      renderInto(container);
+    },
+
+    couple(peerId, container, YM) {
+      _YM = YM;
+      if (!_hubBound) { YM.onHub(onMsg); _hubBound = true; }
+      if (YM.onData) YM.onData(ID, onMsg);
+      const peer = YM.peers.find(p => p.peerId === peerId);
+      const peerUuid = peer?.uuid;
+      const pn = peer?.name || 'Pair';
+
+      const card = document.createElement('div');
+      card.style.cssText = 'background:linear-gradient(135deg,rgba(255,107,53,.1),rgba(124,77,255,.07));border:1px solid rgba(255,107,53,.3);border-radius:12px;padding:14px 16px;text-align:center';
+      card.innerHTML = `<div style="font-size:.62rem;color:#ff6b35;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px">👆 TAP RACE</div><div style="font-size:.78rem;color:var(--text-2);margin-bottom:12px">10 secondes · qui tapera le plus vite ?</div>`;
+      const btn = document.createElement('button');
+      btn.className = 'btn-accent'; btn.textContent = '👆 Défier ' + pn; btn.style.width = '100%';
+      btn.onclick = () => {
+        if (game && game.phase !== 'result') { _YM.toast('Tu as déjà une partie en cours !', 'error'); return; }
+        game = { peerId, peerName: pn, peerUuid, myScore:0, theirScore:0, phase:'waiting', timerTO:null, cdIV:null };
+        send(peerId, { type:'challenge', fromName: YM.profile.name, to: peerUuid });
+        _YM.toast('👆 Défi envoyé à ' + pn + ' !');
+        btn.textContent = '⏳ En attente…'; btn.disabled = true;
+        // Ouvrir la sphere directement pour voir l'état en attente
+        YM.openSphere(ID);
+      };
+      card.appendChild(btn);
+      container.appendChild(card);
+    },
+  };
+})();
