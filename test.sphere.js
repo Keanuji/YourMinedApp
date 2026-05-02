@@ -7,18 +7,23 @@
     category: 'Games',
     description: 'A strategic P2P Connect 4 challenge for two players.',
     
+    broadcastData() {
+      if (this.currentInvite) return { duel_invite: this.currentInvite };
+      return {};
+    },
+
     activate(ctx) {
       this.ctx = ctx;
       this.resetData();
       
-      // Enregistrement automatique sur le bureau si l'API est là
+      // Auto-register on desktop
       if (this.ctx.addIconToDesktop) {
         this.ctx.addIconToDesktop(NAME, this.icon, this.name);
       }
       
       this.ctx.onReceive((type, data, peerId) => {
         if (type === 'move') this.handleMove(data, peerId);
-        if (type === 'challenge') this.handleChallenge(peerId);
+        if (type === 'challenge') this.handleChallenge(data, peerId);
         if (type === 'accept') this.handleAccept(peerId);
         if (type === 'reset') this.resetData();
       });
@@ -26,25 +31,26 @@
 
     resetData() {
       this.board = Array(6).fill(null).map(() => Array(7).fill(null));
-      this.turn = 'host'; // Le host (bleu) commence toujours
+      this.turn = 'host'; // host (blue) starts
       this.role = null; 
       this.opponentId = null;
       this.winner = null;
+      this.currentInvite = null;
       if (this.view) this.render();
     },
 
-    handleChallenge(peerId) {
+    handleChallenge(data, peerId) {
       this.opponentId = peerId;
-      this.role = 'guest'; // On reçoit un défi, on devient l'invité (rose)
+      this.role = 'guest'; // Receiver is guest
       this.ctx.toast('Match challenge received!', 'info');
       this.ctx.send('accept', {}, peerId);
-      this.ctx.openPanel(); // On ouvre le jeu pour accepter le défi visuellement
+      this.ctx.openPanel();
       this.render();
     },
 
     handleAccept(peerId) {
       this.opponentId = peerId;
-      this.role = 'host'; // Notre défi a été accepté, on est l'hôte (bleu)
+      this.role = 'host'; // Sender is host
       this.ctx.toast('Challenge accepted!', 'success');
       this.render();
     },
@@ -99,8 +105,7 @@
         <style>
           .duel-container { font-family: sans-serif; display: flex; flex-direction: column; height: 100%; color: #e4e6f4; }
           .duel-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; background: rgba(255,255,255,0.03); padding: 12px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.08); margin: auto; }
-          .duel-cell { aspect-ratio: 1; background: #06060e; border-radius: 50%; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(255,255,255,0.05); position: relative; }
-          .duel-cell:hover { background: rgba(255,255,255,0.02); }
+          .duel-cell { aspect-ratio: 1; background: #06060e; border-radius: 50%; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(255,255,255,0.05); position: relative; cursor: pointer; }
           .duel-disc { width: 85%; height: 85%; border-radius: 50%; transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); }
           .disc-host { background: #08e0f8; box-shadow: 0 0 15px rgba(8,224,248,0.5); }
           .disc-guest { background: #ff4560; box-shadow: 0 0 15px rgba(255,69,96,0.5); }
@@ -129,14 +134,14 @@
 
     tryMove(r, c) {
       if (this.winner || (this.opponentId && this.turn !== this.role)) return;
-      if (!this.opponentId && !this.role) this.role = 'host';
+      if (!this.opponentId) return;
 
       if (this.board[r][c] !== null) return;
       if (r < 5 && this.board[r+1][c] === null) return;
 
       this.board[r][c] = this.role;
       this.turn = this.role === 'host' ? 'guest' : 'host';
-      if (this.opponentId) this.ctx.send('move', { row: r, col: c }, this.opponentId);
+      this.ctx.send('move', { row: r, col: c }, this.opponentId);
       this.checkWin(r, c);
       this.render();
     },
@@ -147,25 +152,32 @@
     },
 
     peerSection(container, peerCtx) {
+      // Find the peerId from the social sphere's near users list
+      const social = window.YM_Social;
+      const peerProfile = social && social._nearUsers && social._nearUsers.get(peerCtx.uuid);
+      const peerId = peerProfile ? peerProfile.peerId : null;
+
       container.innerHTML = `
         <div style="display:flex; justify-content:space-between; align-items:center; padding:12px; background:rgba(255,255,255,0.03); border-radius:12px; border: 1px solid rgba(255,255,255,0.05);">
           <div style="display:flex; align-items:center; gap:10px">
             <span style="font-size:20px">⚔️</span>
             <div>
                 <div style="font-size:12px; font-weight:700">Neon Duel</div>
-                <div style="font-size:9px; opacity:0.5">Classic strategic battle</div>
+                <div style="font-size:9px; opacity:0.5">Connect 4 P2P Battle</div>
             </div>
           </div>
           <button class="ym-btn ym-btn-accent" style="padding:6px 12px; font-size:10px; background:#f0a830; color:black; border:none; border-radius:6px; font-weight:bold;">CHALLENGE</button>
         </div>
       `;
       container.querySelector('button').onclick = () => {
+        if (!peerId) {
+            this.ctx.toast('User matches currently offline', 'error');
+            return;
+        }
         this.resetData();
-        // Résolution de l'ID : si on a accès à la sphère sociale, on cherche le peerId lié à cet UUID
-        const targetId = window.YM_Social?._nearUsers?.get(peerCtx.uuid)?.peerId || peerCtx.uuid;
-        this.opponentId = targetId;
+        this.opponentId = peerId;
         this.role = 'host';
-        this.ctx.send('challenge', {}, targetId);
+        this.ctx.send('challenge', {}, peerId);
         this.ctx.toast('Challenge sent!', 'info');
         window.YM.closePanel();
         window.YM.openSpherePanel(NAME);
