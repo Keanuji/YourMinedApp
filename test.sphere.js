@@ -11,7 +11,7 @@
       this.ctx = ctx;
       this.resetData();
       
-      // Self-register to desktop if the API is available
+      // Enregistrement automatique sur le bureau si l'API est là
       if (this.ctx.addIconToDesktop) {
         this.ctx.addIconToDesktop(NAME, this.icon, this.name);
       }
@@ -26,7 +26,7 @@
 
     resetData() {
       this.board = Array(6).fill(null).map(() => Array(7).fill(null));
-      this.turn = 'host'; // host (blue) always starts
+      this.turn = 'host'; // Le host (bleu) commence toujours
       this.role = null; 
       this.opponentId = null;
       this.winner = null;
@@ -35,15 +35,16 @@
 
     handleChallenge(peerId) {
       this.opponentId = peerId;
-      this.role = 'guest'; // If I receive a challenge, I am the guest (pink)
+      this.role = 'guest'; // On reçoit un défi, on devient l'invité (rose)
       this.ctx.toast('Match challenge received!', 'info');
       this.ctx.send('accept', {}, peerId);
+      this.ctx.openPanel(); // On ouvre le jeu pour accepter le défi visuellement
       this.render();
     },
 
     handleAccept(peerId) {
       this.opponentId = peerId;
-      this.role = 'host'; // I sent the challenge, I am the host (blue)
+      this.role = 'host'; // Notre défi a été accepté, on est l'hôte (bleu)
       this.ctx.toast('Challenge accepted!', 'success');
       this.render();
     },
@@ -96,7 +97,7 @@
 
       this.view.innerHTML = `
         <style>
-          .duel-container { font-family: 'Space Grotesk', sans-serif; display: flex; flex-direction: column; height: 100%; color: #e4e6f4; }
+          .duel-container { font-family: sans-serif; display: flex; flex-direction: column; height: 100%; color: #e4e6f4; }
           .duel-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; background: rgba(255,255,255,0.03); padding: 12px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.08); margin: auto; }
           .duel-cell { aspect-ratio: 1; background: #06060e; border-radius: 50%; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(255,255,255,0.05); position: relative; }
           .duel-cell:hover { background: rgba(255,255,255,0.02); }
@@ -104,13 +105,13 @@
           .disc-host { background: #08e0f8; box-shadow: 0 0 15px rgba(8,224,248,0.5); }
           .disc-guest { background: #ff4560; box-shadow: 0 0 15px rgba(255,69,96,0.5); }
           .duel-header { text-align: center; margin-bottom: 20px; padding-top: 10px; }
-          .duel-status { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 800; color: #f0a830; letter-spacing: 3px; text-transform: uppercase; }
+          .duel-status { font-weight: 800; color: #f0a830; letter-spacing: 3px; text-transform: uppercase; font-size: 18px; }
           .duel-sub { font-size: 10px; opacity: 0.5; margin-top: 8px; text-transform: uppercase; letter-spacing: 1px; }
         </style>
         <div class="duel-container">
           <div class="duel-header">
             <div class="duel-status">${statusText}</div>
-            <div class="duel-sub">${!this.opponentId ? 'Challenge a peer to start the match' : (this.role === 'host' ? 'Blue' : 'Pink')} Player</div>
+            <div class="duel-sub">${!this.opponentId ? 'Challenge a peer to start' : (this.role === 'host' ? 'Blue' : 'Pink')} Player</div>
           </div>
           <div class="duel-grid">
             ${this.board.map((row, ri) => row.map((cell, ci) => `
@@ -120,7 +121,7 @@
             `).join('')).join('')}
           </div>
           <div style="padding: 20px;">
-            <button class="ym-btn ym-btn-ghost" style="width:100%;" onclick="window.YM_S['${NAME}'].reset()">Reset Game</button>
+            <button class="ym-btn ym-btn-ghost" style="width:100%; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.05); color:white; padding:10px; border-radius:8px;" onclick="window.YM_S['${NAME}'].reset()">Reset Game</button>
           </div>
         </div>
       `;
@@ -128,11 +129,8 @@
 
     tryMove(r, c) {
       if (this.winner || (this.opponentId && this.turn !== this.role)) return;
-      
-      // If alone (testing), let's assume I'm host if role is null
       if (!this.opponentId && !this.role) this.role = 'host';
 
-      // Connect 4 Rule: Must be lowest available slot
       if (this.board[r][c] !== null) return;
       if (r < 5 && this.board[r+1][c] === null) return;
 
@@ -158,16 +156,17 @@
                 <div style="font-size:9px; opacity:0.5">Classic strategic battle</div>
             </div>
           </div>
-          <button class="ym-btn ym-btn-accent" style="padding:6px 12px; font-size:10px">CHALLENGE</button>
+          <button class="ym-btn ym-btn-accent" style="padding:6px 12px; font-size:10px; background:#f0a830; color:black; border:none; border-radius:6px; font-weight:bold;">CHALLENGE</button>
         </div>
       `;
       container.querySelector('button').onclick = () => {
         this.resetData();
-        this.opponentId = peerCtx.uuid;
+        // Résolution de l'ID : si on a accès à la sphère sociale, on cherche le peerId lié à cet UUID
+        const targetId = window.YM_Social?._nearUsers?.get(peerCtx.uuid)?.peerId || peerCtx.uuid;
+        this.opponentId = targetId;
         this.role = 'host';
-        this.ctx.send('challenge', {}, peerCtx.uuid);
+        this.ctx.send('challenge', {}, targetId);
         this.ctx.toast('Challenge sent!', 'info');
-        // Close profile and open game
         window.YM.closePanel();
         window.YM.openSpherePanel(NAME);
       };
