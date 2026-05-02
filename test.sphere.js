@@ -16,17 +16,30 @@
       this.ctx = ctx;
       this.resetData();
       
+      console.log(`[Duel] Activated`);
+
       // Auto-register on desktop
       if (this.ctx.addIconToDesktop) {
         this.ctx.addIconToDesktop(NAME, this.icon, this.name);
       }
       
       this.ctx.onReceive((type, data, peerId) => {
+        console.log(`[Duel] Received: ${type} from ${peerId}`, data);
         if (type === 'move') this.handleMove(data, peerId);
         if (type === 'challenge') this.handleChallenge(data, peerId);
         if (type === 'accept') this.handleAccept(peerId);
         if (type === 'reset') this.resetData();
       });
+
+      // Check for pending challenges (woken up by Social)
+      setTimeout(() => {
+        const p = window.YM_PendingChallenges && window.YM_PendingChallenges[NAME];
+        if (p) {
+          console.log(`[Duel] Picking up pending challenge from ${p.peerId}`);
+          this.handleChallenge(p.data, p.peerId);
+          delete window.YM_PendingChallenges[NAME];
+        }
+      }, 500);
     },
 
     resetData() {
@@ -40,6 +53,7 @@
     },
 
     handleChallenge(data, peerId) {
+      console.log(`[Duel] Handling challenge from ${peerId}`);
       this.opponentId = peerId;
       this.role = 'guest'; // Receiver is guest
       this.ctx.toast('Match challenge received!', 'info');
@@ -49,6 +63,7 @@
     },
 
     handleAccept(peerId) {
+      console.log(`[Duel] Challenge accepted by ${peerId}`);
       this.opponentId = peerId;
       this.role = 'host'; // Sender is host
       this.ctx.toast('Challenge accepted!', 'success');
