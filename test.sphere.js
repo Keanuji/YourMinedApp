@@ -1,5 +1,5 @@
 (function() {
-  const NAME = 'duel.sphere.js';
+  const NAME = 'test.sphere.js';
   window.YM_S = window.YM_S || {};
   window.YM_S[NAME] = {
     name: 'Neon Duel',
