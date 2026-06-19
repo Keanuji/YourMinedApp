@@ -825,8 +825,8 @@
   }
 
   /* ─── REGISTRATION ────────────────────────────────────── */
-  window.YM_S['jackpot.sphere.js'] = {
-    name:        'Jackpot',
+  window.YM_S['Tanobox.sphere.js'] = {
+    name:        'Tanobox',
     icon:        '🎰',
     category:    'Finance',
     description: 'Caisse commune · dons multi-devises · 50/50 · tirage automatique · carte Mastercard virtuelle',
