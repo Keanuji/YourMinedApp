@@ -629,14 +629,54 @@ window.YM_S[SPHERE_ID]={
     },1000);
   },
 
-  peerSection(container,peerCtx){
-    const bd=peerCtx&&peerCtx.profile&&peerCtx.profile.broadcastData;
-    const clock=bd&&bd['clock.sphere.js'];
-    if(!clock||!clock.time){container.innerHTML='<div style="font-size:10px;color:rgba(228,230,244,.3)">No time data</div>';return;}
-    container.innerHTML=
-      '<div style="font-size:13px;font-family:var(--font-m,monospace);color:var(--text,#e4e6f4)">'+esc(clock.time)+
-        (clock.tz?'<span style="font-size:9px;color:rgba(228,230,244,.3);margin-left:6px">'+esc(clock.tz)+'</span>':'')+
-      '</div>';
+  // ── CORRECTIF : peerSection — horloge live si fuseau connu ──
+  peerSection(container, peerCtx){
+    const profile = peerCtx && peerCtx.profile;
+    const bd = profile && profile.broadcastData;
+    const clock = bd && bd['clock.sphere.js'];
+    const tz = (clock && clock.tz) || (profile && profile.tz) || '';
+
+    // Pas de données du tout
+    if(!tz && (!clock || !clock.time)){
+      container.innerHTML='<div style="font-size:10px;color:rgba(228,230,244,.3)">No time data</div>';
+      return;
+    }
+
+    if(tz){
+      // Fuseau connu → horloge live
+      function renderLive(){
+        const d=now(tz);
+        container.innerHTML=
+          '<div style="display:flex;align-items:center;gap:10px">'+
+            '<span style="font-size:22px">🕐</span>'+
+            '<div>'+
+              '<div id="peer-clock-time" style="font-size:20px;font-weight:300;font-family:var(--font-m,monospace);color:var(--text,#e4e6f4);letter-spacing:1px">'+timeStr(d,false)+'</div>'+
+              '<div style="font-size:9px;color:rgba(228,230,244,.3);margin-top:2px">'+esc(tz)+'</div>'+
+            '</div>'+
+          '</div>';
+      }
+      renderLive();
+      const iv=setInterval(()=>{
+        const el=container.querySelector('#peer-clock-time');
+        if(!el){clearInterval(iv);return;}
+        el.textContent=timeStr(now(tz),false);
+      },1000);
+      // Cleanup auto via MutationObserver
+      const obs=new MutationObserver(()=>{
+        if(!document.body.contains(container)){clearInterval(iv);obs.disconnect();}
+      });
+      obs.observe(document.body,{childList:true,subtree:true});
+    } else {
+      // Fallback : heure statique reçue via broadcastData
+      container.innerHTML=
+        '<div style="display:flex;align-items:center;gap:10px">'+
+          '<span style="font-size:22px">🕐</span>'+
+          '<div>'+
+            '<div style="font-size:20px;font-weight:300;font-family:var(--font-m,monospace);color:var(--text,#e4e6f4)">'+esc(clock.time)+'</div>'+
+            '<div style="font-size:9px;color:rgba(228,230,244,.3);margin-top:2px">last seen</div>'+
+          '</div>'+
+        '</div>';
+    }
   },
 };
 
