@@ -129,7 +129,6 @@ function _buildWidget(){
 
   window.addEventListener('ym:page-change',_onPageChange);
 
-  // Drag — exact meteo/radio pattern
   let dragging=false,ox=0,oy=0,wx=0,wy=0,_edgeT=null;
 
   const onMove=(cx,cy)=>{
@@ -189,7 +188,6 @@ function _buildWidget(){
   _widget.addEventListener('pointerup',e=>{document.body.classList.remove('dragging');onEnd();});
   _widget.addEventListener('pointercancel',e=>{document.body.classList.remove('dragging');onEnd();});
 
-  // Click to open panel
   _widget.addEventListener('click',e=>{
     if(!_widget._dragging&&_ctx)_ctx.openPanel();
   });
@@ -204,7 +202,6 @@ async function renderPanel(container){
   const net=getNet();
   const conn=navigator.connection||null;
 
-  // Battery
   if(bat){
     const level=Math.round(bat.level*100);
     const bc=batColor(bat.level,bat.charging);
@@ -230,7 +227,6 @@ async function renderPanel(container){
     container.appendChild(noCard);
   }
 
-  // Network
   const netCard=document.createElement('div');
   netCard.style.cssText='background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:16px';
   netCard.innerHTML=
@@ -251,7 +247,131 @@ async function renderPanel(container){
   container.appendChild(btn);
 }
 
-// ── Sphere ────────────────────────────────────────────────────
+// ── broadcastData — partagé avec les pairs via social presence ─
+function broadcastData(){
+  const net=getNet();
+  const bat=_battery;
+  return{
+    online:net.online,
+    network:net.type,
+    speed:net.speed||null,
+    battery:bat?Math.round(bat.level*100):null,
+    charging:bat?bat.charging:null,
+  };
+}
+
+// ── profileSection — dans ton propre profil → onglet Spheres ──
+// Affiche batterie + réseau en live avec refresh auto
+function profileSection(container){
+  function render(){
+    container.innerHTML='';
+    const net=getNet();
+    const bat=_battery;
+    const level=bat?Math.round(bat.level*100):null;
+    const bc=bat?batColor(bat.level,bat.charging):'rgba(255,255,255,.4)';
+
+    const row=document.createElement('div');
+    row.style.cssText='display:flex;align-items:center;gap:16px;flex-wrap:wrap';
+
+    // Battery block
+    if(level!=null){
+      const batBlock=document.createElement('div');
+      batBlock.style.cssText='display:flex;align-items:center;gap:8px';
+      // Bar
+      const barWrap=document.createElement('div');
+      barWrap.style.cssText='width:36px;height:14px;border:1.5px solid rgba(255,255,255,.2);border-radius:3px;position:relative;overflow:hidden';
+      const barFill=document.createElement('div');
+      barFill.style.cssText='height:100%;width:'+level+'%;background:'+bc+';border-radius:2px;transition:width .5s';
+      // Charging tip
+      const tip=document.createElement('div');
+      tip.style.cssText='position:absolute;right:-5px;top:50%;transform:translateY(-50%);width:4px;height:7px;background:rgba(255,255,255,.2);border-radius:0 2px 2px 0';
+      barWrap.appendChild(barFill);barWrap.appendChild(tip);
+      const batTxt=document.createElement('span');
+      batTxt.style.cssText='font-size:13px;font-weight:700;color:'+bc+';font-family:var(--font-m,monospace)';
+      batTxt.textContent=level+'%'+(bat.charging?' ⚡':'');
+      batBlock.appendChild(barWrap);batBlock.appendChild(batTxt);
+      row.appendChild(batBlock);
+    }
+
+    // Network block
+    const netBlock=document.createElement('div');
+    netBlock.style.cssText='display:flex;align-items:center;gap:6px';
+    const netDot=document.createElement('span');
+    netDot.style.cssText='width:7px;height:7px;border-radius:50%;background:'+(net.online?'#22d98a':'#ff4560')+';flex-shrink:0';
+    const netTxt=document.createElement('span');
+    netTxt.style.cssText='font-size:12px;color:var(--text2);font-family:var(--font-m,monospace)';
+    netTxt.textContent=net.type.toUpperCase()+(net.speed?' · '+net.speed+'M':'');
+    netBlock.appendChild(netDot);netBlock.appendChild(netTxt);
+    row.appendChild(netBlock);
+
+    container.appendChild(row);
+  }
+
+  render();
+  // Refresh toutes les 10s tant que le container est dans le DOM
+  const iv=setInterval(function(){
+    if(!document.body.contains(container)){clearInterval(iv);return;}
+    render();
+  },10000);
+  // Refresh immédiat si batterie disponible
+  getBattery().then(function(bat){
+    if(!bat)return;
+    _battery=bat;
+    bat.addEventListener('levelchange',render);
+    bat.addEventListener('chargingchange',render);
+  });
+}
+
+// ── peerSection — dans le profil d'un pair ─────────────────────
+// Affiche les données réseau reçues via broadcastData (pas la batterie — privée)
+function peerSection(container,peerCtx){
+  container.innerHTML='';
+  const bd=peerCtx&&peerCtx.profile&&peerCtx.profile.broadcastData;
+  const data=bd&&bd['status.sphere.js'];
+
+  if(!data){
+    const empty=document.createElement('div');
+    empty.style.cssText='font-size:11px;color:var(--text3,rgba(228,230,244,.3))';
+    empty.textContent='No status data';
+    container.appendChild(empty);
+    return;
+  }
+
+  const row=document.createElement('div');
+  row.style.cssText='display:flex;align-items:center;gap:14px;flex-wrap:wrap';
+
+  // Battery (si partagée)
+  if(data.battery!=null){
+    const bc=batColor(data.battery/100,data.charging);
+    const batBlock=document.createElement('div');
+    batBlock.style.cssText='display:flex;align-items:center;gap:7px';
+    const barWrap=document.createElement('div');
+    barWrap.style.cssText='width:32px;height:13px;border:1.5px solid rgba(255,255,255,.2);border-radius:3px;overflow:hidden';
+    const barFill=document.createElement('div');
+    barFill.style.cssText='height:100%;width:'+data.battery+'%;background:'+bc+';border-radius:2px';
+    barWrap.appendChild(barFill);
+    const batTxt=document.createElement('span');
+    batTxt.style.cssText='font-size:12px;font-weight:700;color:'+bc+';font-family:var(--font-m,monospace)';
+    batTxt.textContent=data.battery+'%'+(data.charging?' ⚡':'');
+    batBlock.appendChild(barWrap);batBlock.appendChild(batTxt);
+    row.appendChild(batBlock);
+  }
+
+  // Network
+  const netBlock=document.createElement('div');
+  netBlock.style.cssText='display:flex;align-items:center;gap:6px';
+  const netDot=document.createElement('span');
+  netDot.style.cssText='width:7px;height:7px;border-radius:50%;flex-shrink:0;background:'+(data.online?'#22d98a':'#ff4560');
+  const netTxt=document.createElement('span');
+  netTxt.style.cssText='font-size:12px;color:var(--text2);font-family:var(--font-m,monospace)';
+  netTxt.textContent=(data.network||'?').toUpperCase()+(data.speed?' · '+data.speed+'M':'');
+  netBlock.appendChild(netDot);netBlock.appendChild(netTxt);
+  row.appendChild(netBlock);
+
+  container.appendChild(row);
+}
+
+// ── Sphere object ──────────────────────────────────────────────
 window.YM_S[SPHERE_ID]={
   name:'Status',
   icon:'📡',
@@ -260,9 +380,7 @@ window.YM_S[SPHERE_ID]={
 
   activate(ctx){
     _ctx=ctx;
-    // Build widget immediately — don't wait for battery API
     _buildWidget();
-    // Then enrich with battery data if available
     getBattery().then(bat=>{
       if(!bat)return;
       _battery=bat;
@@ -285,10 +403,8 @@ window.YM_S[SPHERE_ID]={
   },
 
   renderPanel,
-
-  broadcastData(){
-    const net=getNet();
-    return{online:net.online,network:net.type};
-  },
+  broadcastData,
+  profileSection,
+  peerSection,
 };
 })();
