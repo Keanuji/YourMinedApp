@@ -57,7 +57,7 @@ const BUILTIN = [
 let _ctx=null, _audio=null, _playing=false, _curStation=null, _widget=null, _vol=0.8;
 let _widgetEnabled=localStorage.getItem('radio_widget')!=='false';
 
-const BLANK_ARTWORK = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+const BLANK_ARTWORK='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
 
 function loadState(){try{return JSON.parse(localStorage.getItem(STATE_KEY)||'{}');}catch(e){return{};}}
 function saveState(d){localStorage.setItem(STATE_KEY,JSON.stringify(d));}
@@ -66,24 +66,23 @@ function saveCustom(d){localStorage.setItem(CUSTOM_KEY,JSON.stringify(d));}
 function loadPos(){try{return JSON.parse(localStorage.getItem(POS_KEY)||'{"right":12,"bottom":90,"page":0}');}catch(e){return{right:12,bottom:90,page:0};}}
 function savePos(p){localStorage.setItem(POS_KEY,JSON.stringify(p));}
 function allStations(){return [...BUILTIN,...loadCustom()];}
+// Station par défaut si aucune sauvegardée : FIP
+function defaultStation(){return BUILTIN[0];}
 
 const _isPC=()=>window.matchMedia('(hover:hover) and (pointer:fine)').matches;
 
 function _getNavBounds(){
   const navBar=document.getElementById('nav-bar');
-  if(!navBar)return{maxRight:window.innerWidth,maxBottom:window.innerHeight,navW:0,navH:0};
+  if(!navBar)return{maxRight:window.innerWidth,maxBottom:window.innerHeight};
   const r=navBar.getBoundingClientRect();
-  if(_isPC()){return{maxRight:r.left,maxBottom:window.innerHeight,navW:r.width,navH:0};}
-  else{return{maxRight:window.innerWidth,maxBottom:r.top,navW:0,navH:r.height};}
+  if(_isPC())return{maxRight:r.left,maxBottom:window.innerHeight};
+  return{maxRight:window.innerWidth,maxBottom:r.top};
 }
-
 function _clampPos(wx,wy){
   const bounds=_getNavBounds();
   const ww=_widget?_widget.offsetWidth:200;
   const wh=_widget?_widget.offsetHeight:90;
-  const cx=Math.max(0,Math.min(bounds.maxRight-ww,wx));
-  const cy=Math.max(0,Math.min(bounds.maxBottom-wh,wy));
-  return{x:cx,y:cy};
+  return{x:Math.max(0,Math.min(bounds.maxRight-ww,wx)),y:Math.max(0,Math.min(bounds.maxBottom-wh,wy))};
 }
 
 function getAudio(){
@@ -93,18 +92,26 @@ function getAudio(){
   }
   return _audio;
 }
+
 function play(station){
   _curStation=station;
   const a=getAudio();a.src=station.url;a.volume=_vol;
   a.play().catch(e=>{if(window.YM_toast)window.YM_toast('Stream error: '+e.message,'error');});
-  _playing=true;saveState({station,vol:_vol,playing:true});
+  _playing=true;
+  saveState({station,vol:_vol,playing:true});
   _updateMediaSession();_refreshWidget();_refreshPanel();
+  // Broadcaster aux pairs via ctx
+  if(_ctx&&_ctx.send){try{_ctx.send('radio:now',{station:station.name,genre:station.genre,country:station.country});}catch(e){}}
 }
+
 function stop(){
   const a=getAudio();a.pause();a.src='';
-  _playing=false;saveState(Object.assign({},loadState(),{playing:false}));
+  _playing=false;
+  saveState(Object.assign({},loadState(),{playing:false}));
   _updateMediaSession();_refreshWidget();_refreshPanel();
+  if(_ctx&&_ctx.send){try{_ctx.send('radio:now',{station:null});}catch(e){}}
 }
+
 function toggle(){if(_playing)stop();else if(_curStation)play(_curStation);}
 function nextStation(){const all=allStations();const idx=_curStation?all.findIndex(s=>s.url===_curStation.url):-1;play(all[(idx+1)%all.length]);}
 function prevStation(){const all=allStations();const idx=_curStation?all.findIndex(s=>s.url===_curStation.url):-1;play(all[(idx-1+all.length)%all.length]);}
@@ -141,11 +148,7 @@ function createWidget(){
 
   const spawnPage=window._deskCurPage||0;
   const pos=loadPos();
-  const savedPage=pos.page||0;
-  // Use savedPage if POS_KEY exists, otherwise spawn on current page
-  // Do NOT clamp to pageCount — registerWidgetPage will create the page if needed
-  // If desk already knows our page (from _widgetPages persistence), trust it
-  const targetPage=localStorage.getItem(POS_KEY)?savedPage:spawnPage;
+  const targetPage=localStorage.getItem(POS_KEY)?(pos.page||0):spawnPage;
 
   _widget=document.createElement('div');
   _widget.id='ym-radio-widget';
@@ -164,10 +167,8 @@ function createWidget(){
     const rect=_widget.getBoundingClientRect();
     const clamped=_clampPos(rect.left,rect.top);
     if(clamped.x!==rect.left||clamped.y!==rect.top){
-      _widget.style.left=clamped.x+'px';
-      _widget.style.top=clamped.y+'px';
-      _widget.style.right='';
-      _widget.style.bottom='';
+      _widget.style.left=clamped.x+'px';_widget.style.top=clamped.y+'px';
+      _widget.style.right='';_widget.style.bottom='';
     }
   });
 
@@ -185,46 +186,27 @@ function createWidget(){
 
   const onMove=(cx,cy)=>{
     if(!dragging)return;
-    const rawX=wx+(cx-ox);
-    const rawY=wy+(cy-oy);
+    const rawX=wx+(cx-ox),rawY=wy+(cy-oy);
     ox=cx;oy=cy;
-    const clamped=_clampPos(rawX,rawY);
-    wx=clamped.x;wy=clamped.y;
+    const c=_clampPos(rawX,rawY);wx=c.x;wy=c.y;
     _widget.style.left=wx+'px';_widget.style.top=wy+'px';
     _widget.style.right='';_widget.style.bottom='';
-
     const vw=_isPC()?window.innerWidth-72:window.innerWidth;
-    const ew=vw*0.15;
-    const curPage=window._deskCurPage||0;
+    const ew=vw*0.15,curPage=window._deskCurPage||0;
     if(cx<ew&&curPage>0){
-      if(!_edgeT)_edgeT=setTimeout(()=>{
-        _edgeT=null;
-        const tp=curPage-1;
-        if(window.YM_Desk)window.YM_Desk.goPage(tp);
-        _registerPage(tp);
-        const p=loadPos();savePos(Object.assign({},p,{page:tp}));
-      },500);
+      if(!_edgeT)_edgeT=setTimeout(()=>{_edgeT=null;const tp=curPage-1;if(window.YM_Desk)window.YM_Desk.goPage(tp);_registerPage(tp);const p=loadPos();savePos(Object.assign({},p,{page:tp}));},500);
     }else if(cx>vw-ew){
-      if(!_edgeT)_edgeT=setTimeout(()=>{
-        _edgeT=null;
-        const tp=(window._deskCurPage||0)+1;
-        if(window.YM_Desk)window.YM_Desk.goPageOrCreate(tp);
-        _registerPage(tp);
-        const p=loadPos();savePos(Object.assign({},p,{page:tp}));
-      },500);
+      if(!_edgeT)_edgeT=setTimeout(()=>{_edgeT=null;const tp=(window._deskCurPage||0)+1;if(window.YM_Desk)window.YM_Desk.goPageOrCreate(tp);_registerPage(tp);const p=loadPos();savePos(Object.assign({},p,{page:tp}));},500);
     }else{clearTimeout(_edgeT);_edgeT=null;}
   };
 
   const onEnd=()=>{
     if(!dragging)return;dragging=false;_widget._dragging=false;
     clearTimeout(_edgeT);_edgeT=null;
-    const bounds=_getNavBounds();
     const ww=_widget.offsetWidth,wh=_widget.offsetHeight;
-    const r=Math.max(0,window.innerWidth-wx-ww);
-    const b=Math.max(0,window.innerHeight-wy-wh);
+    const r=Math.max(0,window.innerWidth-wx-ww),b=Math.max(0,window.innerHeight-wy-wh);
     const curPage=window._deskCurPage||0;
-    _registerPage(curPage);
-    savePos({right:r,bottom:b,page:curPage});
+    _registerPage(curPage);savePos({right:r,bottom:b,page:curPage});
     _syncWidgetPage();
     setTimeout(()=>{if(window.YM_Desk)window.YM_Desk.autoCleanPages();},100);
   };
@@ -237,17 +219,15 @@ function createWidget(){
     _widget.style.left=wx+'px';_widget.style.top=wy+'px';
     _widget.style.right='';_widget.style.bottom='';
     ox=e.clientX;oy=e.clientY;
-    e.preventDefault();
-    _widget.setPointerCapture(e.pointerId);
+    e.preventDefault();_widget.setPointerCapture(e.pointerId);
   },{passive:false});
   _widget.addEventListener('pointermove',e=>{if(dragging)onMove(e.clientX,e.clientY);},{passive:false});
   _widget.addEventListener('pointerup',onEnd);
   _widget.addEventListener('pointercancel',onEnd);
 }
 
-const _onPageChange=()=>{_syncWidgetPage();};
+const _onPageChange=()=>_syncWidgetPage();
 
-// FIX: use YM_Desk registry as source of truth, not localStorage
 function _syncWidgetPage(){
   if(!_widget)return;
   if(!document.body.contains(_widget)){_widget=null;createWidget();return;}
@@ -257,10 +237,8 @@ function _syncWidgetPage(){
     const rp=window.YM_Desk.registeredWidgetPage(WIDGET_ID);
     if(rp!=null)widgetPage=rp;
     else widgetPage=loadPos().page||0;
-  }else{
-    widgetPage=loadPos().page||0;
-  }
-  const curPage=(window._deskCurPage!=null?window._deskCurPage:0);
+  }else{widgetPage=loadPos().page||0;}
+  const curPage=window._deskCurPage!=null?window._deskCurPage:0;
   const visible=curPage===widgetPage;
   _widget.style.transition='opacity .25s ease';
   _widget.style.opacity=visible?'1':'0';
@@ -292,13 +270,21 @@ function _refreshWidget(){
 }
 
 function removeWidget(){
-  if(_widget){
-    window.removeEventListener('ym:page-change',_onPageChange);
-    _widget.remove();_widget=null;
-  }
+  if(_widget){window.removeEventListener('ym:page-change',_onPageChange);_widget.remove();_widget=null;}
   _unregisterPage();
 }
 
+// ── broadcastData — écoute live partagée avec les pairs ───────
+function broadcastData(){
+  return{
+    station: _playing&&_curStation?_curStation.name:null,
+    genre:   _playing&&_curStation?_curStation.genre:null,
+    country: _playing&&_curStation?_curStation.country:null,
+    playing: _playing,
+  };
+}
+
+// ── renderPanel ────────────────────────────────────────────────
 function renderPanel(container){
   container.style.cssText='display:flex;flex-direction:column;height:100%';
   container.innerHTML='';
@@ -317,8 +303,7 @@ function renderPanel(container){
     else if(_widget&&document.body.contains(_widget)){_widget.remove();_widget=null;}
     renderPanel(container);
   });
-  wRow.appendChild(wBtn);
-  container.appendChild(wRow);
+  wRow.appendChild(wBtn);container.appendChild(wRow);
 
   const nowEl=document.createElement('div');
   nowEl.style.cssText='flex-shrink:0;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);text-align:center';
@@ -361,20 +346,27 @@ function renderPanel(container){
   });
 
   function renderNow(){
-    const n=(_curStation&&_curStation.name)||'—';
-    const g=(_curStation&&_curStation.genre)||'';
+    // ── Si aucune station connue → auto-sélectionner la station par défaut ──
+    if(!_curStation){
+      const def=defaultStation();
+      _curStation=def;
+      play(def); // démarre directement
+      return; // renderNow sera rappelé via _refreshPanel → _panelRefresh
+    }
+    const n=_curStation.name;
+    const g=_curStation.genre||'';
     nowEl.innerHTML=
-      '<div style="font-size:10px;color:var(--text3);margin-bottom:4px">'+(_playing?'▶ NOW PLAYING':'STOPPED')+'</div>'+
+      '<div style="font-size:10px;color:var(--text3);margin-bottom:4px;font-family:var(--font-m,monospace)">'+(_playing?'▶ NOW PLAYING':'PAUSED')+'</div>'+
       '<div style="font-size:15px;font-weight:600;color:var(--text);margin-bottom:2px">'+n+'</div>'+
       (g?'<div style="font-size:11px;color:var(--text3);margin-bottom:8px">'+g+'</div>':'<div style="height:8px"></div>')+
-      '<div style="display:flex;justify-content:center;gap:12px">'+
-        '<button id="pnl-prev" style="background:none;border:none;color:var(--text3);font-size:20px;cursor:pointer">⏮</button>'+
-        '<button id="pnl-pp" class="ym-btn '+(_playing?'ym-btn-ghost':'ym-btn-accent')+'" style="font-size:14px;padding:6px 18px">'+(_playing?'⏸ Pause':'▶ Play')+'</button>'+
-        '<button id="pnl-next" style="background:none;border:none;color:var(--text3);font-size:20px;cursor:pointer">⏭</button>'+
+      '<div style="display:flex;justify-content:center;align-items:center;gap:12px">'+
+        '<button id="pnl-prev" style="background:none;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">⏮</button>'+
+        '<button id="pnl-pp" class="ym-btn '+(_playing?'ym-btn-ghost':'ym-btn-accent')+'" style="font-size:14px;padding:6px 20px;min-width:90px">'+(_playing?'⏸ Pause':'▶ Play')+'</button>'+
+        '<button id="pnl-next" style="background:none;border:none;color:var(--text3);font-size:20px;cursor:pointer;line-height:1">⏭</button>'+
       '</div>';
-    nowEl.querySelector('#pnl-prev').addEventListener('click',()=>{prevStation();renderNow();});
-    nowEl.querySelector('#pnl-pp').addEventListener('click',()=>{toggle();renderNow();});
-    nowEl.querySelector('#pnl-next').addEventListener('click',()=>{nextStation();renderNow();});
+    nowEl.querySelector('#pnl-prev').addEventListener('click',()=>{prevStation();});
+    nowEl.querySelector('#pnl-pp').addEventListener('click',()=>{toggle();});
+    nowEl.querySelector('#pnl-next').addEventListener('click',()=>{nextStation();});
   }
 
   function renderStations(){
@@ -400,33 +392,143 @@ function renderPanel(container){
       row.innerHTML=
         '<div style="width:8px;height:8px;border-radius:50%;flex-shrink:0;background:'+(isActive&&_playing?'var(--gold)':'rgba(255,255,255,.15)')+'"></div>'+
         '<span style="font-size:14px;flex-shrink:0">'+(s.country||'🌐')+'</span>'+
-        '<div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:'+(isActive?600:400)+';overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+s.name+'</div>'+(s.genre?'<div style="font-size:10px;color:var(--text3)">'+s.genre+'</div>':'')+
-        '</div>'+(i>=BUILTIN.length?'<button data-del="'+(i-BUILTIN.length)+'" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:15px;padding:2px 6px">×</button>':'');
+        '<div style="flex:1;min-width:0">'+
+          '<div style="font-size:13px;font-weight:'+(isActive?600:400)+';overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+s.name+'</div>'+
+          (s.genre?'<div style="font-size:10px;color:var(--text3)">'+s.genre+'</div>':'')+
+        '</div>'+
+        (i>=BUILTIN.length?'<button data-del="'+(i-BUILTIN.length)+'" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:15px;padding:2px 6px">×</button>':'');
       row.addEventListener('click',e=>{
         if(e.target.dataset.del!==undefined)return;
         const scrollY=list.scrollTop;
         if(isActive)toggle();else play(s);
-        renderNow();renderStations();
         requestAnimationFrame(()=>{list.scrollTop=scrollY;});
       });
       const delBtn=row.querySelector('[data-del]');
-      if(delBtn){
-        delBtn.addEventListener('click',e=>{
-          e.stopPropagation();
-          const c=loadCustom();c.splice(parseInt(e.target.dataset.del),1);saveCustom(c);renderStations();
-        });
-      }
+      if(delBtn){delBtn.addEventListener('click',e=>{
+        e.stopPropagation();
+        const c=loadCustom();c.splice(parseInt(e.target.dataset.del),1);saveCustom(c);renderStations();
+      });}
       list.appendChild(row);
     });
+    // Scroller jusqu'à la station active
+    if(_curStation){
+      const activeIdx=stations.findIndex(s=>s.url===_curStation.url);
+      if(activeIdx>0){
+        requestAnimationFrame(()=>{
+          const rows=list.querySelectorAll('[style*="border-bottom"]');
+          // ~54px par row, +coBar
+          list.scrollTop=Math.max(0,(activeIdx-2)*54);
+        });
+      }
+    }
   }
 
-  renderNow();renderStations();
+  renderNow();
+  renderStations();
 }
 
+// ── profileSection — dans ton propre profil ────────────────────
+function profileSection(container){
+  function render(){
+    container.innerHTML='';
+    const n=(_curStation&&_curStation.name)||'—';
+    const g=(_curStation&&_curStation.genre)||'';
+    const wrap=document.createElement('div');
+    wrap.style.cssText='display:flex;align-items:center;gap:10px';
+    // Dot animé si en lecture
+    const dot=document.createElement('span');
+    dot.style.cssText='width:8px;height:8px;border-radius:50%;flex-shrink:0;background:'+(_playing?'var(--gold,#f0a830)':'rgba(255,255,255,.2)')+';'+ (_playing?'animation:ym-pulse 1s ease infinite':'');
+    const info=document.createElement('div');
+    info.style.cssText='flex:1;min-width:0';
+    const nameEl=document.createElement('div');
+    nameEl.style.cssText='font-size:12px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    nameEl.textContent=n;
+    const genreEl=document.createElement('div');
+    genreEl.style.cssText='font-size:10px;color:var(--text3)';
+    genreEl.textContent=_playing?'▶ ON AIR'+(g?' — '+g:''):'⏹ '+g;
+    info.appendChild(nameEl);info.appendChild(genreEl);
+    const ppBtn=document.createElement('button');
+    ppBtn.className='ym-btn ym-btn-ghost';
+    ppBtn.style.cssText='font-size:11px;padding:4px 10px;flex-shrink:0';
+    ppBtn.textContent=_playing?'⏸':'▶';
+    ppBtn.addEventListener('click',()=>{
+      if(!_curStation){play(defaultStation());return;}
+      toggle();render();
+    });
+    const nxBtn=document.createElement('button');
+    nxBtn.className='ym-btn ym-btn-ghost';
+    nxBtn.style.cssText='font-size:11px;padding:4px 8px;flex-shrink:0';
+    nxBtn.textContent='⏭';
+    nxBtn.addEventListener('click',()=>{nextStation();render();});
+    wrap.appendChild(dot);wrap.appendChild(info);wrap.appendChild(ppBtn);wrap.appendChild(nxBtn);
+    container.appendChild(wrap);
+  }
+  render();
+  // Listener pour mise à jour si état change depuis widget
+  const _obs=new MutationObserver(()=>{if(!document.body.contains(container))_obs.disconnect();});
+  _obs.observe(document.body,{childList:true,subtree:true});
+}
+
+// ── peerSection — écoute live du pair ─────────────────────────
+function peerSection(container,peerCtx){
+  container.innerHTML='';
+  const bd=peerCtx&&peerCtx.profile&&peerCtx.profile.broadcastData;
+  const data=bd&&bd['radio.sphere.js'];
+
+  const wrap=document.createElement('div');
+  wrap.style.cssText='display:flex;align-items:center;gap:10px';
+
+  if(!data||!data.station){
+    // Pas en écoute
+    const dot=document.createElement('span');
+    dot.style.cssText='width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.15);flex-shrink:0';
+    const txt=document.createElement('span');
+    txt.style.cssText='font-size:12px;color:var(--text3)';
+    txt.textContent='Not listening';
+    wrap.appendChild(dot);wrap.appendChild(txt);
+  }else{
+    // En écoute — afficher station + bouton "Écouter aussi"
+    const dot=document.createElement('span');
+    dot.style.cssText='width:8px;height:8px;border-radius:50%;background:var(--gold,#f0a830);flex-shrink:0;animation:ym-pulse 1s ease infinite';
+    const info=document.createElement('div');
+    info.style.cssText='flex:1;min-width:0';
+    const nameEl=document.createElement('div');
+    nameEl.style.cssText='font-size:12px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    nameEl.textContent='▶ '+data.station;
+    const genreEl=document.createElement('div');
+    genreEl.style.cssText='font-size:10px;color:var(--text3)';
+    genreEl.textContent=(data.country?data.country+' ':'')+(data.genre||'');
+    info.appendChild(nameEl);info.appendChild(genreEl);
+
+    // Bouton "Listen too" — trouve la station dans la liste et la joue
+    const listenBtn=document.createElement('button');
+    listenBtn.className='ym-btn ym-btn-ghost';
+    listenBtn.style.cssText='font-size:11px;padding:4px 10px;flex-shrink:0;border-color:rgba(240,168,48,.3);color:var(--gold,#f0a830)';
+    listenBtn.textContent='Listen too';
+    listenBtn.addEventListener('click',()=>{
+      // Chercher la station par nom dans la liste
+      const found=allStations().find(s=>s.name===data.station);
+      if(found){
+        play(found);
+        listenBtn.textContent='▶ Playing';
+        listenBtn.disabled=true;
+        // Ouvrir le panel radio
+        if(window.YM&&window.YM.openSpherePanel)window.YM.openSpherePanel('radio.sphere.js');
+      }else{
+        if(window.YM_toast)window.YM_toast('Station not found locally','warn');
+      }
+    });
+
+    wrap.appendChild(dot);wrap.appendChild(info);wrap.appendChild(listenBtn);
+  }
+  container.appendChild(wrap);
+}
+
+// ── Sphere object ──────────────────────────────────────────────
 window.YM_S['radio.sphere.js']={
   name:'Radio',icon:'📻',category:'Media',
-  description:'Internet radio — background playback, draggable desktop widget',
-  emit:[],receive:[],
+  description:'Internet radio — background playback, live sharing, draggable widget',
+  emit:['radio:now'],receive:[],
 
   activate(ctx){
     _ctx=ctx;
@@ -437,7 +539,21 @@ window.YM_S['radio.sphere.js']={
     }
     const st=loadState();
     _vol=st.vol||0.8;
-    if(st.station){_curStation=st.station;if(st.playing)play(st.station);}
+    // ── Ouvrir sur une écoute — restaurer la dernière station ──
+    // Si une station est sauvegardée → la sélectionner
+    // Si elle était en lecture → reprendre automatiquement
+    // Si rien → prendre la station par défaut mais ne pas auto-play (nécessite geste utilisateur)
+    if(st.station){
+      _curStation=st.station;
+      if(st.playing){
+        // Reprendre la lecture (la page était déjà en cours)
+        play(st.station);
+      }
+      // Sinon : station sélectionnée mais pas auto-play (pas de geste user)
+    }else{
+      // Première utilisation : pré-sélectionner FIP sans auto-play
+      _curStation=defaultStation();
+    }
     createWidget();
     document._ymRadioVisHandler=()=>{
       if(document.visibilityState==='visible'){
@@ -460,30 +576,8 @@ window.YM_S['radio.sphere.js']={
   },
 
   renderPanel,
-
-  profileSection(container){
-    const n=(_curStation&&_curStation.name)||'—';
-    const el=document.createElement('div');
-    el.style.cssText='display:flex;align-items:center;gap:10px';
-    el.innerHTML=
-      '<span style="font-size:16px">📻</span>'+
-      '<div style="flex:1;font-size:12px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(_playing?'▶ '+n:'⏹ '+n)+'</div>'+
-      '<button id="ps-rad-pp" class="ym-btn ym-btn-ghost" style="font-size:11px">'+(_playing?'Stop':'Play')+'</button>'+
-      '<button id="ps-rad-nx" class="ym-btn ym-btn-ghost" style="font-size:11px">⏭</button>';
-    el.querySelector('#ps-rad-pp').addEventListener('click',()=>{
-      if(!_curStation){if(window.YM)window.YM.openSpherePanel('radio.sphere.js');return;}
-      toggle();
-      el.querySelector('#ps-rad-pp').textContent=_playing?'Stop':'Play';
-    });
-    el.querySelector('#ps-rad-nx').addEventListener('click',nextStation);
-    container.appendChild(el);
-  },
-
-  peerSection(container){
-    const info=document.createElement('div');
-    info.style.cssText='font-size:11px;color:var(--text3)';
-    info.textContent='📻 Has Radio sphere active';
-    container.appendChild(info);
-  }
+  broadcastData,
+  profileSection,
+  peerSection,
 };
 })();
