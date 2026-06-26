@@ -1,6 +1,6 @@
 [
   {
-    "filename": "jackpot.sphere.js",
+    "filename": "Tanobox.sphere.js",
     "author": "GABatPZGUZbURx1FfvS3YBFkqjUWxMNCgze2b4NqvWEp",
     "ghAuthor": "Keanuji",
     "last_committer": "Keanuji",
@@ -9,7 +9,7 @@
     "timestamp": 1776619284,
     "merged_at": 1776620204,
     "burnSlot": 448770336,
-    "codeUrl": "https://raw.githubusercontent.com/Keanuji/YourMinedApp/main/jackpot.sphere.js"
+    "codeUrl": "https://raw.githubusercontent.com/Keanuji/YourMinedApp/main/Tanobox.sphere.js"
   },
   {
     "filename": "activity.sphere.js",
