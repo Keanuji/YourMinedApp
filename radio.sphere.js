@@ -8,6 +8,7 @@ const WIDGET_ID  = 'radio';
 const STATE_KEY  = 'ym_radio_state_v1';
 const CUSTOM_KEY = 'ym_radio_custom_v1';
 const POS_KEY    = 'ym_radio_pos_v1';
+const CLONE_KEY  = 'ym_radio_clone_v1';
 
 const BUILTIN = [
   {name:'FIP',             url:'https://icecast.radiofrance.fr/fip-midfi.mp3',           genre:'Eclectic',       country:'🇫🇷'},
@@ -56,6 +57,8 @@ const BUILTIN = [
 
 let _ctx=null, _audio=null, _playing=false, _curStation=null, _widget=null, _vol=0.8;
 let _widgetEnabled=localStorage.getItem('radio_widget')!=='false';
+// ── Clone (follow a visited peer's live radio) ──────────────────
+let _cloneTarget=null; // {id, name} of the peer we are currently following, or null
 
 const BLANK_ARTWORK='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
 
@@ -65,6 +68,8 @@ function loadCustom(){try{return JSON.parse(localStorage.getItem(CUSTOM_KEY)||'[
 function saveCustom(d){localStorage.setItem(CUSTOM_KEY,JSON.stringify(d));}
 function loadPos(){try{return JSON.parse(localStorage.getItem(POS_KEY)||'{"right":12,"bottom":90,"page":0}');}catch(e){return{right:12,bottom:90,page:0};}}
 function savePos(p){localStorage.setItem(POS_KEY,JSON.stringify(p));}
+function loadClone(){try{return JSON.parse(localStorage.getItem(CLONE_KEY)||'null');}catch(e){return null;}}
+function saveClone(d){if(d)localStorage.setItem(CLONE_KEY,JSON.stringify(d));else localStorage.removeItem(CLONE_KEY);}
 function allStations(){return [...BUILTIN,...loadCustom()];}
 // Station par défaut si aucune sauvegardée : FIP
 function defaultStation(){return BUILTIN[0];}
@@ -93,6 +98,11 @@ function getAudio(){
   return _audio;
 }
 
+function _myUuid(){
+  var p=window.YM&&window.YM.getProfile&&window.YM.getProfile();
+  return p&&p.uuid;
+}
+
 function play(station){
   _curStation=station;
   const a=getAudio();a.src=station.url;a.volume=_vol;
@@ -100,8 +110,9 @@ function play(station){
   _playing=true;
   saveState({station,vol:_vol,playing:true});
   _updateMediaSession();_refreshWidget();_refreshPanel();
-  // Broadcaster aux pairs via ctx
-  if(_ctx&&_ctx.send){try{_ctx.send('radio:now',{station:station.name,genre:station.genre,country:station.country});}catch(e){}}
+  // Broadcaster aux pairs via ctx — on inclut notre uuid pour que les clones puissent
+  // identifier l'émetteur, quelle que soit la façon dont le transport livre l'expéditeur.
+  if(_ctx&&_ctx.send){try{_ctx.send('radio:now',{uuid:_myUuid(),station:station.name,genre:station.genre,country:station.country});}catch(e){}}
 }
 
 function stop(){
@@ -109,12 +120,42 @@ function stop(){
   _playing=false;
   saveState(Object.assign({},loadState(),{playing:false}));
   _updateMediaSession();_refreshWidget();_refreshPanel();
-  if(_ctx&&_ctx.send){try{_ctx.send('radio:now',{station:null});}catch(e){}}
+  if(_ctx&&_ctx.send){try{_ctx.send('radio:now',{uuid:_myUuid(),station:null});}catch(e){}}
 }
 
-function toggle(){if(_playing)stop();else if(_curStation)play(_curStation);}
-function nextStation(){const all=allStations();const idx=_curStation?all.findIndex(s=>s.url===_curStation.url):-1;play(all[(idx+1)%all.length]);}
-function prevStation(){const all=allStations();const idx=_curStation?all.findIndex(s=>s.url===_curStation.url):-1;play(all[(idx-1+all.length)%all.length]);}
+// Lecture/arrêt manuel — coupe le clonage en cours (l'utilisateur reprend la main)
+function toggle(){if(_cloneTarget)stopClone();if(_playing)stop();else if(_curStation)play(_curStation);}
+function nextStation(){if(_cloneTarget)stopClone();const all=allStations();const idx=_curStation?all.findIndex(s=>s.url===_curStation.url):-1;play(all[(idx+1)%all.length]);}
+function prevStation(){if(_cloneTarget)stopClone();const all=allStations();const idx=_curStation?all.findIndex(s=>s.url===_curStation.url):-1;play(all[(idx-1+all.length)%all.length]);}
+
+// ── Clone helpers ────────────────────────────────────────────
+// Un seul clonage actif à la fois : démarrer un nouveau clone remplace l'ancien.
+function isCloning(peerId){return !!(peerId&&_cloneTarget&&_cloneTarget.id===peerId);}
+
+function _applyCloneData(data){
+  if(!data||!data.station){
+    if(_playing)stop();
+    return;
+  }
+  if(_curStation&&_curStation.name===data.station&&_playing)return; // déjà synchronisé
+  const found=allStations().find(s=>s.name===data.station);
+  if(found)play(found);
+}
+
+function startClone(peerId,peerName,initialData){
+  if(!peerId)return;
+  _cloneTarget={id:peerId,name:peerName||'this user'};
+  saveClone(_cloneTarget);
+  if(initialData)_applyCloneData(initialData);
+  _refreshWidget();_refreshPanel();
+}
+
+function stopClone(){
+  if(!_cloneTarget)return;
+  _cloneTarget=null;
+  saveClone(null);
+  _refreshWidget();_refreshPanel();
+}
 
 function _updateMediaSession(){
   if(!('mediaSession' in navigator))return;
@@ -249,12 +290,14 @@ function _refreshWidget(){
   if(!_widget)return;
   const name=(_curStation&&_curStation.name)||'No station';
   const genre=(_curStation&&_curStation.genre)||'';
+  const cloneTag=_cloneTarget?('<div style="font-size:8px;color:var(--gold);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">🔗 following '+_cloneTarget.name+'</div>'):'';
   _widget.innerHTML=
     '<div style="display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:grab">'+
       '<span style="font-size:16px">📻</span>'+
       '<div style="flex:1;min-width:0">'+
         '<div style="font-size:11px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+name+'</div>'+
         '<div style="font-size:9px;color:'+(_playing?'var(--gold)':'var(--text3)')+'">'+(_playing?'▶ ON AIR — '+genre:'⏹ stopped')+'</div>'+
+        cloneTag+
       '</div>'+
     '</div>'+
     '<div style="display:flex;align-items:center;justify-content:space-around;padding:4px 8px 8px;gap:4px">'+
@@ -304,6 +347,22 @@ function renderPanel(container){
     renderPanel(container);
   });
   wRow.appendChild(wBtn);container.appendChild(wRow);
+
+  // ── Clone banner — visible directement dans la sphère quand un clonage est actif ──
+  if(_cloneTarget){
+    const cloneRow=document.createElement('div');
+    cloneRow.style.cssText='flex-shrink:0;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 16px;background:rgba(232,160,32,.1);border-bottom:1px solid rgba(255,255,255,.06)';
+    const cloneTxt=document.createElement('span');
+    cloneTxt.style.cssText='font-size:11px;color:var(--gold,#f0a830);overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    cloneTxt.textContent='🔗 Cloning '+_cloneTarget.name+"'s radio";
+    const uncloneBtn=document.createElement('button');
+    uncloneBtn.className='ym-btn ym-btn-ghost';
+    uncloneBtn.style.cssText='font-size:10px;padding:3px 9px;flex-shrink:0';
+    uncloneBtn.textContent='Unclone';
+    uncloneBtn.addEventListener('click',()=>{stopClone();});
+    cloneRow.appendChild(cloneTxt);cloneRow.appendChild(uncloneBtn);
+    container.appendChild(cloneRow);
+  }
 
   const nowEl=document.createElement('div');
   nowEl.style.cssText='flex-shrink:0;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);text-align:center';
@@ -400,7 +459,7 @@ function renderPanel(container){
       row.addEventListener('click',e=>{
         if(e.target.dataset.del!==undefined)return;
         const scrollY=list.scrollTop;
-        if(isActive)toggle();else play(s);
+        if(isActive)toggle();else{if(_cloneTarget)stopClone();play(s);}
         requestAnimationFrame(()=>{list.scrollTop=scrollY;});
       });
       const delBtn=row.querySelector('[data-del]');
@@ -445,7 +504,7 @@ function profileSection(container){
     nameEl.textContent=n;
     const genreEl=document.createElement('div');
     genreEl.style.cssText='font-size:10px;color:var(--text3)';
-    genreEl.textContent=_playing?'▶ ON AIR'+(g?' — '+g:''):'⏹ '+g;
+    genreEl.textContent=(_cloneTarget?'🔗 following '+_cloneTarget.name+' — ':'')+(_playing?'▶ ON AIR'+(g?' — '+g:''):'⏹ '+g);
     info.appendChild(nameEl);info.appendChild(genreEl);
     const ppBtn=document.createElement('button');
     ppBtn.className='ym-btn ym-btn-ghost';
@@ -469,11 +528,14 @@ function profileSection(container){
   _obs.observe(document.body,{childList:true,subtree:true});
 }
 
-// ── peerSection — écoute live du pair ─────────────────────────
+// ── peerSection — écoute live du pair + Clone/Unclone ──────────
 function peerSection(container,peerCtx){
   container.innerHTML='';
   const bd=peerCtx&&peerCtx.profile&&peerCtx.profile.broadcastData;
   const data=bd&&bd['radio.sphere.js'];
+  // Forme réelle de peerCtx observée dans profile.js: {uuid, isNear, isReciproc, profile}
+  const peerId=peerCtx&&peerCtx.uuid;
+  const peerName=(peerCtx&&peerCtx.profile&&peerCtx.profile.name)||'this user';
 
   const wrap=document.createElement('div');
   wrap.style.cssText='display:flex;align-items:center;gap:10px';
@@ -483,11 +545,11 @@ function peerSection(container,peerCtx){
     const dot=document.createElement('span');
     dot.style.cssText='width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.15);flex-shrink:0';
     const txt=document.createElement('span');
-    txt.style.cssText='font-size:12px;color:var(--text3)';
+    txt.style.cssText='font-size:12px;color:var(--text3);flex:1';
     txt.textContent='Not listening';
     wrap.appendChild(dot);wrap.appendChild(txt);
   }else{
-    // En écoute — afficher station + bouton "Écouter aussi"
+    // En écoute — afficher station
     const dot=document.createElement('span');
     dot.style.cssText='width:8px;height:8px;border-radius:50%;background:var(--gold,#f0a830);flex-shrink:0;animation:ym-pulse 1s ease infinite';
     const info=document.createElement('div');
@@ -499,36 +561,32 @@ function peerSection(container,peerCtx){
     genreEl.style.cssText='font-size:10px;color:var(--text3)';
     genreEl.textContent=(data.country?data.country+' ':'')+(data.genre||'');
     info.appendChild(nameEl);info.appendChild(genreEl);
-
-    // Bouton "Listen too" — trouve la station dans la liste et la joue
-    const listenBtn=document.createElement('button');
-    listenBtn.className='ym-btn ym-btn-ghost';
-    listenBtn.style.cssText='font-size:11px;padding:4px 10px;flex-shrink:0;border-color:rgba(240,168,48,.3);color:var(--gold,#f0a830)';
-    listenBtn.textContent='Listen too';
-    listenBtn.addEventListener('click',()=>{
-      // Chercher la station par nom dans la liste
-      const found=allStations().find(s=>s.name===data.station);
-      if(found){
-        play(found);
-        listenBtn.textContent='▶ Playing';
-        listenBtn.disabled=true;
-        // Ouvrir le panel radio
-        if(window.YM&&window.YM.openSpherePanel)window.YM.openSpherePanel('radio.sphere.js');
-      }else{
-        if(window.YM_toast)window.YM_toast('Station not found locally','warn');
-      }
-    });
-
-    wrap.appendChild(dot);wrap.appendChild(info);wrap.appendChild(listenBtn);
+    wrap.appendChild(dot);wrap.appendChild(info);
   }
+
+  // ── Bouton Clone / Unclone ──
+  // Un seul clonage actif à la fois pour ce visiteur (startClone remplace toute cible précédente).
+  const cloning=isCloning(peerId);
+  const cloneBtn=document.createElement('button');
+  cloneBtn.className='ym-btn ym-btn-ghost';
+  cloneBtn.style.cssText='font-size:11px;padding:4px 10px;flex-shrink:0'+(cloning?';background:var(--gold,#f0a830);color:#000;border-color:var(--gold,#f0a830)':'');
+  cloneBtn.textContent=cloning?'🔗 Unclone':'🔗 Clone';
+  cloneBtn.addEventListener('click',()=>{
+    if(!peerId){if(window.YM_toast)window.YM_toast('Cannot identify this user','warn');return;}
+    if(cloning)stopClone();
+    else startClone(peerId,peerName,data);
+    peerSection(container,peerCtx);
+  });
+  wrap.appendChild(cloneBtn);
+
   container.appendChild(wrap);
 }
 
 // ── Sphere object ──────────────────────────────────────────────
 window.YM_S['radio.sphere.js']={
   name:'Radio',icon:'📻',category:'Media',
-  description:'Internet radio — background playback, live sharing, draggable widget',
-  emit:['radio:now'],receive:[],
+  description:'Internet radio — background playback, live sharing, draggable widget, clone a visited profile\'s live listening',
+  emit:['radio:now'],receive:['radio:now'],
 
   activate(ctx){
     _ctx=ctx;
@@ -539,6 +597,7 @@ window.YM_S['radio.sphere.js']={
     }
     const st=loadState();
     _vol=st.vol||0.8;
+    _cloneTarget=loadClone();
     // ── Ouvrir sur une écoute — restaurer la dernière station ──
     // Si une station est sauvegardée → la sélectionner
     // Si elle était en lecture → reprendre automatiquement
@@ -563,6 +622,20 @@ window.YM_S['radio.sphere.js']={
       }
     };
     document.addEventListener('visibilitychange',document._ymRadioVisHandler);
+
+    // ── Écoute en temps réel du pair cloné ──
+    // ctx.onReceive (voir app.js/mkCtx) filtre déjà les messages par nom de sphère
+    // et donne (type, data, peerId). peerId est l'id de transport P2P (éphémère),
+    // pas l'UUID de profil — d'où l'uuid embarqué dans les payloads envoyés par
+    // play()/stop(), qu'on compare ici à _cloneTarget.id.
+    if(_ctx&&typeof _ctx.onReceive==='function'){
+      _ctx.onReceive((type,data)=>{
+        if(type!=='radio:now')return;
+        if(_cloneTarget&&data&&data.uuid===_cloneTarget.id){
+          _applyCloneData(data);
+        }
+      });
+    }
   },
 
   deactivate(){
