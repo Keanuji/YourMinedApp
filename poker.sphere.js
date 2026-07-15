@@ -78,7 +78,7 @@ function mkTable(opts){
     id:gid(),host:_myUUID,name:opts.name||'Table',
     players:[{uuid:_myUUID,name:_myName,chips:opts.chips||1000,bet:0,folded:false,allIn:false,hand:[],ready:true}],
     maxPlayers:opts.max||6,state:'waiting',
-    deck:[],board:[],pot:0,roundBets:{},
+    deck:[],board:[],pot:0,roundBets:{},acted:{},
     cur:0,dealer:0,bb:opts.bb||20,sb:opts.sb||10,
     ts:Date.now()
   };
@@ -89,6 +89,15 @@ function tablePub(t){
     bb:t.bb,sb:t.sb,ts:t.ts,players:t.players.map(p=>({uuid:p.uuid,name:p.name,chips:p.chips}))};
 }
 
+// ── VUE FILTRÉE (masque les mains adverses, y compris pour le host lui-même) ──
+function _myView(t){
+  if(!t) return t;
+  if(t.revealed) return t; // showdown : tout le monde voit toutes les mains
+  return {...t, players:(t.players||[]).map(p=>
+    p.uuid===_myUUID ? p : {...p, hand:(p.hand||[]).map(()=>null)}
+  )};
+}
+
 // ── GAME LOGIC (HOST ONLY) ─────────────────────────────────────────────────────
 function startGame(tableId){
   const t=_tables[tableId];
@@ -97,7 +106,7 @@ function startGame(tableId){
 
   t.state='preflop';
   t.deck=shuffle(newDeck());
-  t.board=[];t.pot=0;t.roundBets={};
+  t.board=[];t.pot=0;t.roundBets={};t.acted={};
   t.players.forEach(p=>{p.folded=false;p.allIn=false;p.bet=0;p.hand=[t.deck.pop(),t.deck.pop()];});
   t.dealer=(t.dealer+1)%t.players.length;
 
@@ -136,10 +145,12 @@ function doAction(tableId,uuid,action,amount){
   const t=_tables[tableId];
   if(!t||t.host!==_myUUID)return;
   if(t.players[t.cur]?.uuid!==uuid){return;}
+  t.acted=t.acted||{};
 
   const p=t.players[t.cur];
-  const maxBet=Math.max(0,...Object.values(t.roundBets).map(Number));
-  const toCall=maxBet-(t.roundBets[uuid]||0);
+  const maxBetBefore=Math.max(0,...Object.values(t.roundBets).map(Number));
+  const toCall=maxBetBefore-(t.roundBets[uuid]||0);
+  let reopens=false;
 
   if(action==='fold'){
     p.folded=true;
@@ -155,12 +166,18 @@ function doAction(tableId,uuid,action,amount){
     p.chips-=total;p.bet+=total;t.pot+=total;
     t.roundBets[uuid]=(t.roundBets[uuid]||0)+total;
     if(p.chips===0)p.allIn=true;
+    reopens=true; // une relance rouvre le tour de parole pour tout le monde
   }else if(action==='allin'){
     const a=p.chips;
     p.chips=0;p.bet+=a;t.pot+=a;
     t.roundBets[uuid]=(t.roundBets[uuid]||0)+a;
     p.allIn=true;
+    const maxBetAfter=Math.max(0,...Object.values(t.roundBets).map(Number));
+    if(maxBetAfter>maxBetBefore) reopens=true;
   }
+
+  if(reopens) t.acted={};
+  t.acted[uuid]=true;
 
   advanceGame(t);
 }
@@ -171,10 +188,14 @@ function advanceGame(t){
   // Un seul joueur restant → il gagne
   if(active.length===1){endRound(t,active);return;}
 
-  // Vérifie si tous ont agi
   const maxBet=Math.max(0,...Object.values(t.roundBets).map(Number));
   const canAct=t.players.filter(p=>!p.folded&&!p.allIn);
-  const allCalled=canAct.every(p=>(t.roundBets[p.uuid]||0)>=maxBet);
+
+  // Plus personne ne peut agir (tous all-in ou foldés) → on abat le board automatiquement
+  if(canAct.length===0){ _runOutBoard(t); return; }
+
+  // Tout le monde doit avoir explicitement agi ET être à égalité de mise
+  const allCalled = canAct.every(p => t.acted[p.uuid] && (t.roundBets[p.uuid]||0)>=maxBet);
 
   if(allCalled){
     // Passe à la street suivante
@@ -182,12 +203,25 @@ function advanceGame(t){
     else if(t.state==='flop'){t.state='turn';t.board.push(t.deck.pop());}
     else if(t.state==='turn'){t.state='river';t.board.push(t.deck.pop());}
     else{endRound(t,showdown(t));return;}
-    t.roundBets={};
+    t.roundBets={};t.acted={};
     t.cur=_nextActive(t,(t.dealer+1)%t.players.length);
   }else{
     t.cur=_nextActive(t,(t.cur+1)%t.players.length);
   }
   pushState(t);
+}
+
+// Quand plus personne ne peut miser (tous all-in) : révèle les streets restantes automatiquement
+function _runOutBoard(t){
+  const deal=()=>{
+    if(t.state==='preflop'){t.state='flop';t.board.push(t.deck.pop(),t.deck.pop(),t.deck.pop());}
+    else if(t.state==='flop'){t.state='turn';t.board.push(t.deck.pop());}
+    else if(t.state==='turn'){t.state='river';t.board.push(t.deck.pop());}
+    else{endRound(t,showdown(t));return;}
+    pushState(t);
+    setTimeout(deal,900);
+  };
+  deal();
 }
 
 function showdown(t){
@@ -215,7 +249,7 @@ function endRound(t,winners){
     setTimeout(()=>{t.state='finished';pushState(t);},3000);
   }else{
     setTimeout(()=>{
-      t.state='waiting';t.board=[];t.roundBets={};
+      t.state='waiting';t.board=[];t.roundBets={};t.acted={};
       t.players.forEach(p=>{p.bet=0;p.hand=[];p.folded=false;p.allIn=false;});
       pushState(t);
     },4000);
@@ -226,30 +260,36 @@ function endRound(t,winners){
 function pushStateRevealed(t){
   const view={...t,deck:[],revealed:true};
   t.players.forEach(p=>{
-    if(p.uuid===_myUUID){_tables[t.id]={...t};renderGame();}
+    if(p.uuid===_myUUID){_tables[t.id]={...t,revealed:true};renderGame();}
     else{const pid=peerOf(p.uuid);if(pid)st(pid,'pk:state',{...view});}
   });
 }
 
-// Push normal — cache les mains des adversaires
+// Push normal — cache les mains des adversaires. Le host garde son état complet
+// (nécessaire pour continuer les calculs de deck/mains) et l'affiche via _myView().
 function pushState(t){
   t.players.forEach(p=>{
+    if(p.uuid===_myUUID){
+      _tables[t.id]=t; // état complet et réel — jamais masqué en mémoire
+      renderGame();     // masqué uniquement à l'affichage, via _myView()
+      return;
+    }
     const view={
       ...t,
       deck:[], // ne jamais envoyer le deck
+      revealed:false,
       players:t.players.map(pl=>({
         uuid:pl.uuid,name:pl.name,chips:pl.chips,bet:pl.bet,
         folded:pl.folded,allIn:pl.allIn,
         hand:pl.uuid===p.uuid?pl.hand:pl.hand.map(()=>null)
       }))
     };
-    if(p.uuid===_myUUID){_tables[t.id]=t;renderGame();}
-    else{const pid=peerOf(p.uuid);if(pid)st(pid,'pk:state',view);}
+    const pid=peerOf(p.uuid);if(pid)st(pid,'pk:state',view);
   });
 }
 
 function renderGame(){
-  if(_activeTable&&_fullscreenEl)renderFullscreen(_fullscreenEl,_tables[_activeTable]);
+  if(_activeTable&&_fullscreenEl)renderFullscreen(_fullscreenEl,_myView(_tables[_activeTable]));
 }
 
 // ── RECEIVE ────────────────────────────────────────────────────────────────────
@@ -276,14 +316,13 @@ function onReceive(type,data,peerId){
     const tableData=data.fullState?data.table:data.table;
     _tables[tableData.id]={...tableData,_remote:true};
     _activeTable=tableData.id;
-    if(_fullscreenEl)renderFullscreen(_fullscreenEl,_tables[tableData.id]);
+    if(_fullscreenEl)renderFullscreen(_fullscreenEl,_myView(_tables[tableData.id]));
     else openFullscreen(tableData.id);
     _refreshTables&&_refreshTables();
   }
   else if(type==='pk:state'){
-    const prev=_tables[data.id];
     _tables[data.id]={...data,_remote:true};
-    if(_activeTable===data.id&&_fullscreenEl)renderFullscreen(_fullscreenEl,_tables[data.id]);
+    if(_activeTable===data.id&&_fullscreenEl)renderFullscreen(_fullscreenEl,_myView(_tables[data.id]));
     _refreshTables&&_refreshTables();
   }
   else if(type==='pk:action'){
@@ -310,7 +349,7 @@ function openFullscreen(tableId){
   el.style.cssText='position:fixed;inset:0;z-index:9990;background:#0a1628;display:flex;flex-direction:column;overflow:hidden';
   document.body.appendChild(el);
   _fullscreenEl=el;_activeTable=tableId;
-  renderFullscreen(el,_tables[tableId]);
+  renderFullscreen(el,_myView(_tables[tableId]));
 }
 
 function closeFullscreen(){
