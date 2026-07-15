@@ -20,6 +20,19 @@
     { x: GRID_W/2,   y: GRID_H-9, dir: 'up'    },
   ];
 
+  // Résolution peerId — cherche dans tous les peers connus (même logique que poker.sphere.js)
+  function peerOf(uuid){
+    const near=window.YM_Social?._nearUsers;
+    if(near&&near.has(uuid))return near.get(uuid).peerId||null;
+    const peers=window.YM_P2P?.peers;
+    if(peers){
+      for(const[pid,info]of peers){
+        if(info&&info.uuid===uuid)return pid;
+      }
+    }
+    return null;
+  }
+
   window.YM_S = window.YM_S || {};
   window.YM_S[NAME] = {
     name: 'Neon Duel',
@@ -46,9 +59,8 @@
         if (type === 'sn:lobby')    this._onLobbySync(data, peerId);
         if (type === 'sn:ready')    this._onReady(data, peerId);
         if (type === 'sn:start')    this._onStart(data, peerId);
-        if (type === 'sn:move')     this._onMove(data, peerId);
-        if (type === 'sn:dead')     this._onDead(data, peerId);
-        if (type === 'sn:food')     this._onFood(data, peerId);
+        if (type === 'sn:dir')      this._onDir(data, peerId);
+        if (type === 'sn:tick')     this._onTick(data);
         if (type === 'sn:reset')    this._onRemoteReset();
       });
       setTimeout(() => {
@@ -68,7 +80,8 @@
       this.snakes = {};
       this.foods = [];
       this.winner = null;
-      this._pendingDir = null;
+      this._pendingDirs = {};
+      this._lastSentDir = null;
       if (this.view) this._render();
     },
 
@@ -79,7 +92,8 @@
       this.phase = 'playing';
       this._initSnake(0, null);
       this.foods = [this._spawnFood()];
-      this._pendingDir = null;
+      this._pendingDirs = {};
+      this._lastSentDir = null;
       this._render();
       this._ticker = setInterval(() => this._tick(), TICK_MS);
     },
@@ -95,11 +109,31 @@
     _invite(peerId, peerName) {
       if (!this.isHost || this.phase !== 'lobby') return;
       if (this.lobby.length >= 4) { this.ctx.toast('Lobby full', 'warn'); return; }
+      if (this.lobby.some(p => p.peerId === peerId)) { this.ctx.toast('Already invited', 'info'); return; }
       const slot = this.lobby.length;
       this.lobby.push({ slot, peerId, name: peerName || 'Player '+(slot+1), ready: false });
       this.ctx.send('sn:invited', { slot, snapshot: this._snap() }, peerId);
       this._broadcastLobby();
       this._render();
+    },
+
+    // Invite tous les contacts joignables d'un coup (comme poker.sphere.js)
+    _getContacts() {
+      try { return JSON.parse(localStorage.getItem('ym_contacts_v1') || '[]'); }
+      catch(e) { return []; }
+    },
+    _inviteAllContacts() {
+      if (!this.isHost || this.phase !== 'lobby') return;
+      let sent = 0;
+      this._getContacts().forEach(c => {
+        if (this.lobby.length >= 4) return;
+        const pid = peerOf(c.uuid);
+        if (pid && !this.lobby.some(p => p.peerId === pid)) {
+          this._invite(pid, c.nickname || (c.profile && c.profile.name) || 'Player');
+          sent++;
+        }
+      });
+      this.ctx.toast(sent ? sent+' invite(s) sent' : 'No nearby contacts', 'info');
     },
 
     _snap() { return this.lobby.map(p => ({ slot: p.slot, name: p.name, ready: p.ready })); },
@@ -170,7 +204,7 @@
         if (p.peerId) this.ctx.send('sn:start', { snapshot, foods: this.foods }, p.peerId);
       });
       this.phase = 'playing';
-      this._pendingDir = null;
+      this._pendingDirs = {};
       this._countdown(3);
     },
 
@@ -180,7 +214,8 @@
         this._initSnake(p.slot, this.lobby.find(l=>l.slot===p.slot)?.peerId||null);
       });
       this.phase = 'playing';
-      this._pendingDir = null;
+      this._pendingDirs = {};
+      this._lastSentDir = null;
       this._countdown(3);
     },
 
@@ -199,7 +234,11 @@
 
     _countdown(n) {
       this._render(n);
-      if (n === 0) { this._startTicker(); return; }
+      if (n === 0) {
+        // Seuls le host (multi) et le solo simulent le jeu ; les invités attendent les sn:tick
+        if (this.isHost || this.isSolo) this._startTicker();
+        return;
+      }
       setTimeout(() => this._countdown(n-1), 1000);
     },
 
@@ -208,79 +247,115 @@
       this._ticker = setInterval(() => this._tick(), TICK_MS);
     },
 
+    // ── Envoi de la direction voulue ──────────────────────────────────────────
+    // Host/solo : appliquée directement au prochain tick.
+    // Invité : envoyée au host, qui est seul à simuler la partie.
+    _setDir(dir) {
+      if (this.isHost || this.isSolo) {
+        this._pendingDirs = this._pendingDirs || {};
+        this._pendingDirs[this.mySlot] = dir;
+      } else {
+        if (this._lastSentDir === dir) return;
+        this._lastSentDir = dir;
+        const host = this.lobby.find(p => p.slot === 0);
+        if (host && host.peerId) this.ctx.send('sn:dir', { slot: this.mySlot, dir }, host.peerId);
+      }
+    },
+
+    // Le host reçoit la direction voulue d'un invité
+    _onDir(data, peerId) {
+      if (!this.isHost) return;
+      const snake = this.snakes[data.slot];
+      if (!snake || snake.peerId !== peerId) return; // seul le propriétaire du slot peut l'influencer
+      this._pendingDirs = this._pendingDirs || {};
+      this._pendingDirs[data.slot] = data.dir;
+    },
+
+    // ── Boucle de jeu — ne tourne que côté host (multi) ou solo ──────────────
     _tick() {
       if (this.phase !== 'playing') return;
-      const me = this.snakes[this.mySlot];
-      if (!me?.alive) return;
-      if (this._pendingDir && !this._isOpposite(me.dir, this._pendingDir)) {
-        me.dir = this._pendingDir;
-        this._pendingDir = null;
-      }
-      const head = me.cells[0];
-      const next = this._nextPos(head.x, head.y, me.dir);
-      this.lobby.forEach(p => {
-        if (p.peerId) this.ctx.send('sn:move', { slot: this.mySlot, dir: me.dir, head: next }, p.peerId);
-      });
-      this._applyMove(this.mySlot, next, me.dir);
-      this._drawCanvas();
-      this._checkOver();
-    },
+      if (!this.isHost && !this.isSolo) return; // sécurité : un invité ne doit jamais simuler
 
-    _applyMove(slot, next, dir) {
-      const snake = this.snakes[slot];
-      if (!snake?.alive) return;
-      snake.dir = dir;
-      if (next.x<0||next.x>=GRID_W||next.y<0||next.y>=GRID_H) {
-        snake.alive = false;
-        if (slot === this.mySlot) this._broadcastDead(slot);
-        return;
-      }
-      for (const s of Object.values(this.snakes)) {
-        if (s.cells.some(c => c.x===next.x && c.y===next.y)) {
-          snake.alive = false;
-          if (slot === this.mySlot) this._broadcastDead(slot);
-          return;
+      this._pendingDirs = this._pendingDirs || {};
+      const nextHeads = {};
+      Object.entries(this.snakes).forEach(([slot, s]) => {
+        if (!s.alive) return;
+        const wanted = this._pendingDirs[slot];
+        if (wanted && !this._isOpposite(s.dir, wanted)) s.dir = wanted;
+        delete this._pendingDirs[slot];
+        nextHeads[slot] = this._nextPos(s.cells[0].x, s.cells[0].y, s.dir);
+      });
+
+      // Détecte les collisions frontales (deux têtes visent la même case)
+      const headCounts = {};
+      Object.values(nextHeads).forEach(h => {
+        const k = h.x + ',' + h.y;
+        headCounts[k] = (headCounts[k] || 0) + 1;
+      });
+
+      const dead = new Set();
+      const ateFood = {};
+      Object.entries(nextHeads).forEach(([slot, next]) => {
+        const key = next.x + ',' + next.y;
+        let isDead = next.x<0||next.x>=GRID_W||next.y<0||next.y>=GRID_H;
+        if (!isDead && headCounts[key] > 1) isDead = true;
+        if (!isDead) {
+          for (const other of Object.values(this.snakes)) {
+            if (other.cells.some(c => c.x===next.x && c.y===next.y)) { isDead = true; break; }
+          }
         }
-      }
-      snake.cells.unshift({ x: next.x, y: next.y });
-      const fi = this.foods.findIndex(f => f.x===next.x && f.y===next.y);
-      if (fi !== -1) {
-        snake.score++;
-        const scoreEl = document.getElementById('sn-score-'+slot);
-        if(scoreEl) scoreEl.textContent = snake.score;
-        if (this.isHost || this.isSolo) {
-          const newFood = this._spawnFood();
-          this.foods[fi] = newFood;
-          this.lobby.forEach(p => {
-            if (p.peerId) this.ctx.send('sn:food', { index: fi, food: newFood }, p.peerId);
-          });
-        } else { this.foods.splice(fi, 1); }
-      } else { snake.cells.pop(); }
-    },
-
-    _onMove(data, peerId) {
-      const snake = this.snakes[data.slot];
-      if (!snake || snake.peerId !== peerId) return;
-      this._applyMove(data.slot, data.head, data.dir);
-      this._drawCanvas();
-      this._checkOver();
-    },
-
-    _onDead(data, peerId) {
-      const snake = this.snakes[data.slot];
-      if (snake) snake.alive = false;
-      this._drawCanvas();
-    },
-
-    _onFood(data, peerId) {
-      if (data.index < this.foods.length) this.foods[data.index] = data.food;
-      else this.foods.push(data.food);
-    },
-
-    _broadcastDead(slot) {
-      this.lobby.forEach(p => {
-        if (p.peerId) this.ctx.send('sn:dead', { slot }, p.peerId);
+        if (isDead) dead.add(slot);
+        else {
+          const fi = this.foods.findIndex(f => f.x===next.x && f.y===next.y);
+          if (fi !== -1) ateFood[slot] = fi;
+        }
       });
+
+      Object.entries(nextHeads).forEach(([slot, next]) => {
+        const s = this.snakes[slot];
+        if (dead.has(slot)) { s.alive = false; return; }
+        s.cells.unshift({ x: next.x, y: next.y });
+        if (ateFood[slot] !== undefined) {
+          s.score++;
+          const scoreEl = document.getElementById('sn-score-'+slot);
+          if (scoreEl) scoreEl.textContent = s.score;
+          this.foods[ateFood[slot]] = this._spawnFood();
+        } else {
+          s.cells.pop();
+        }
+      });
+
+      this._checkOver();
+      this._syncGuests();
+      this._drawCanvas();
+    },
+
+    // Diffuse l'état officiel du jeu à chaque invité (topologie en étoile)
+    _syncGuests() {
+      if (!this.isHost) return;
+      const payload = {
+        phase: this.phase,
+        winner: this.winner,
+        snakes: Object.fromEntries(Object.entries(this.snakes).map(([slot,s]) =>
+          [slot, { cells: s.cells, dir: s.dir, alive: s.alive, score: s.score }]
+        )),
+        foods: this.foods,
+      };
+      this.lobby.forEach(p => { if (p.peerId) this.ctx.send('sn:tick', payload, p.peerId); });
+    },
+
+    // Un invité applique l'état reçu du host — il ne simule jamais lui-même
+    _onTick(data) {
+      if (this.isHost || this.isSolo) return;
+      Object.entries(data.snakes).forEach(([slot, s]) => {
+        this.snakes[slot] = Object.assign(this.snakes[slot] || {}, s);
+      });
+      this.foods = data.foods;
+      const wasPlaying = this.phase === 'playing';
+      this.phase = data.phase;
+      this.winner = data.winner;
+      if (wasPlaying && data.phase !== 'playing') this._render();
+      else this._drawCanvas();
     },
 
     _checkOver() {
@@ -361,7 +436,6 @@
       return (a==='up'&&b==='down')||(a==='down'&&b==='up')||
              (a==='left'&&b==='right')||(a==='right'&&b==='left');
     },
-    _setDir(dir) { this._pendingDir = dir; },
 
     _drawCanvas() {
       const cw = this._cw, ch = this._ch, cell = this._cell;
@@ -525,6 +599,7 @@
         b += `</div>`;
         if (this.isHost && this.lobby.length < 4) {
           b += `<div class="sn-status" style="font-size:9px;opacity:.35">${this.lobby.length}/4 — invite from peer profiles</div>`;
+          b += `<button class="sn-btn ghost" style="width:100%;font-size:11px" onclick="window.YM_S['${NAME}']._inviteAllContacts()">✉ Invite contacts</button>`;
         }
         b += `<div class="sn-row">`;
         if (!iAmReady) b += `<button class="sn-btn green" onclick="window.YM_S['${NAME}']._setReady()">✓ I'm Ready</button>`;
@@ -657,15 +732,15 @@
     peerSection(container, peerCtx) {
       const self = this;
       const canInvite = self.isHost && self.phase === 'lobby' && self.lobby.length < 4;
-      container.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;padding:12px;background:rgba(255,255,255,.03);border-radius:12px;border:1px solid rgba(255,255,255,.05)"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:22px">🐍</span><div><div style="font-size:12px;font-weight:700;color:#fff">Snake Battle</div><div style="font-size:9px;opacity:.5;margin-top:1px">${canInvite?'Invite to your lobby':'Create a lobby first'}</div></div></div><button style="padding:6px 14px;font-size:10px;letter-spacing:.08em;font-weight:700;font-family:monospace;cursor:${canInvite?'pointer':'default'};border-radius:6px;background:${canInvite?'rgba(8,224,248,.12)':'rgba(255,255,255,.04)'};color:${canInvite?'#08e0f8':'rgba(255,255,255,.25)'};border:1px solid ${canInvite?'rgba(8,224,248,.3)':'rgba(255,255,255,.08)'}">INVITE</button></div>`;
+      container.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;padding:12px;background:rgba(255,255,255,.03);border-radius:12px;border:1px solid rgba(255,255,255,.05)"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:22px">🐍</span><div><div style="font-size:12px;font-weight:700;color:#fff">Neon Duel</div><div style="font-size:9px;opacity:.5;margin-top:1px">${canInvite?'Invite to your lobby':(self.isHost?'Lobby full or already started':'Host a battle to invite')}</div></div></div><button id="sn-inv-btn" style="padding:6px 14px;font-size:10px;letter-spacing:.08em;font-weight:700;font-family:monospace;cursor:${canInvite?'pointer':'default'};border-radius:6px;background:${canInvite?'rgba(8,224,248,.12)':'rgba(255,255,255,.04)'};color:${canInvite?'#08e0f8':'rgba(255,255,255,.25)'};border:1px solid ${canInvite?'rgba(8,224,248,.3)':'rgba(255,255,255,.08)'}">INVITE</button></div>`;
       if (canInvite) {
-        container.querySelector('button').onclick = () => {
-          const peerId = peerCtx.peerId || peerCtx.uuid;
-          const name = peerCtx.name || peerCtx.displayName || ('Player '+(self.lobby.length+1));
-          if (!peerId) { self.ctx.toast('Peer offline', 'error'); return; }
+        container.querySelector('#sn-inv-btn').addEventListener('click', () => {
+          const peerId = peerOf(peerCtx.uuid);
+          const name = (peerCtx.profile && peerCtx.profile.name) || 'Player';
+          if (!peerId) { self.ctx.toast('Player not reachable — must be nearby', 'error'); return; }
           self._invite(peerId, name);
-          self.ctx.toast('Invited!', 'success');
-        };
+          self.ctx.toast('Invite sent!', 'success');
+        });
       }
     },
   };
