@@ -1,29 +1,45 @@
 // social.sphere.js — YourMine Social Sphere
+//
+// FIXES:
+//  - broadcastPresence: log explicite si YM_P2P absent + retry automatique
+//    quand P2P devient disponible (via ym:p2p-ready event ou polling)
+//  - handlePresence: logs détaillés pour chaque packet reçu
+//  - startHeartbeat: log de chaque battement
+//  - activate: log complet du cycle de vie
+//  - _p2pReadyWatcher: attend que YM_P2P soit dispo avant le 1er heartbeat
 (function(){
 'use strict';
 window.YM_S = window.YM_S || {};
 
-const GOSSIP_TTL          = 15 * 60 * 1000;  // 15min
-const GOSSIP2_TTL         = 30 * 60 * 1000;  // 30min pour gossip2
+const GOSSIP_TTL          = 15 * 60 * 1000;
+const GOSSIP2_TTL         = 30 * 60 * 1000;
 const NEAR_RADIUS         = 100;
 const HEARTBEAT_INTERVAL  = 5000;
 const NEAR_TIMEOUT        = 15000;
 const SOCIAL_KEY          = 'ym_social_v1';
 const CONTACTS_KEY        = 'ym_contacts_v1';
 const GOSSIP_STORAGE_KEY  = 'ym_gossip_cache_v1';
-const GOSSIP_MAX_ENTRIES  = 200;  // plafond mémoire
+const GOSSIP_MAX_ENTRIES  = 200;
+
+// ── Logger interne ─────────────────────────────────────────────────────────
+const _L  = (...a) => console.log ('[Social]', ...a);
+const _W  = (...a) => console.warn('[Social]', ...a);
+const _E  = (...a) => console.error('[Social]', ...a);
 
 // ── STATE ──────────────────────────────────────────────────────────────────
 let _ctx = null;
-let _nearUsers   = new Map();  // uuid → {profile, ts, peerId}
-// gossipCache : tous les profils vus, directs ET relayés
-// {uuid → {profile, ts, source: 'direct'|'relay', relayedBy: uuid|null}}
+let _nearUsers   = new Map();
 let _gossipCache = new Map();
 let _watchId     = null;
 let _myCoords    = null;
 let _heartbeatTimer = null;
 let _cleanTimer     = null;
 let _refreshNear    = null;
+// FIX: watcher qui attend que YM_P2P soit prêt
+let _p2pReadyInterval = null;
+// Compteur de broadcasts pour le log
+let _broadcastCount = 0;
+let _receiveCount   = 0;
 
 // ── STORAGE ────────────────────────────────────────────────────────────────
 function loadState(){try{return JSON.parse(localStorage.getItem(SOCIAL_KEY)||'{}');}catch{return{};}}
@@ -45,11 +61,9 @@ function updateNickname(uuid,nickname){
 }
 
 // ── GOSSIP PERSISTENCE ─────────────────────────────────────────────────────
-// Persiste le gossipCache dans localStorage pour survivre aux rechargements
 function _persistGossip(){
   const entries=[];
   _gossipCache.forEach((v,k)=>entries.push([k,v]));
-  // Trier par ts desc et tronquer au plafond
   entries.sort((a,b)=>b[1].ts-a[1].ts);
   const trimmed=entries.slice(0,GOSSIP_MAX_ENTRIES);
   try{localStorage.setItem(GOSSIP_STORAGE_KEY,JSON.stringify(trimmed));}catch(e){}
@@ -58,21 +72,29 @@ function _loadGossipFromStorage(){
   try{
     const raw=JSON.parse(localStorage.getItem(GOSSIP_STORAGE_KEY)||'[]');
     const now=Date.now();
+    let loaded=0;
     raw.forEach(([uuid,entry])=>{
-      if(now-entry.ts<GOSSIP2_TTL)_gossipCache.set(uuid,entry);
+      if(now-entry.ts<GOSSIP2_TTL){_gossipCache.set(uuid,entry);loaded++;}
     });
-  }catch(e){}
+    _L(`gossip loaded from storage: ${loaded} entries`);
+  }catch(e){_W('gossip load error:', e.message);}
 }
 
 // ── GEO ────────────────────────────────────────────────────────────────────
 function startGeo(){
-  if(!navigator.geolocation)return;
-  _watchId=navigator.geolocation.watchPosition(pos=>{
-    _myCoords={lat:pos.coords.latitude,lng:pos.coords.longitude,acc:pos.coords.accuracy};
-  },null,{enableHighAccuracy:true,maximumAge:5000,timeout:10000});
+  if(!navigator.geolocation){_W('geolocation not available');return;}
+  _watchId=navigator.geolocation.watchPosition(
+    pos=>{
+      _myCoords={lat:pos.coords.latitude,lng:pos.coords.longitude,acc:pos.coords.accuracy};
+      _L(`geo update: lat=${_myCoords.lat.toFixed(5)} lng=${_myCoords.lng.toFixed(5)} acc=${_myCoords.acc.toFixed(0)}m`);
+    },
+    err=>{_W('geo error:', err.code, err.message);},
+    {enableHighAccuracy:true,maximumAge:5000,timeout:10000}
+  );
+  _L('geo watch started');
 }
 function stopGeo(){
-  if(_watchId!==null){navigator.geolocation.clearWatch(_watchId);_watchId=null;}
+  if(_watchId!==null){navigator.geolocation.clearWatch(_watchId);_watchId=null;_L('geo watch stopped');}
 }
 function haversine(lat1,lng1,lat2,lng2){
   const R=6371000,dLat=(lat2-lat1)*Math.PI/180,dLng=(lng2-lng1)*Math.PI/180;
@@ -86,7 +108,6 @@ function buildProfilePacket(){
   const state=loadState();
   const contactUUIDs=loadContacts().map(c=>c.uuid);
 
-  // Broadcastdata des sphères actives
   const extraData={};
   if(window.YM_sphereRegistry){
     window.YM_sphereRegistry.forEach((sphere)=>{
@@ -96,9 +117,6 @@ function buildProfilePacket(){
     });
   }
 
-  // ── Gossip1 : inclure un résumé des peers directs vus récemment ──
-  // On partage les UUIDs + timestamps de nos gossip directs pour que
-  // les autres puissent savoir qui on a vu (sans re-partager tout le profil)
   const gossipSnapshot=[];
   const now=Date.now();
   _gossipCache.forEach((entry,uuid)=>{
@@ -126,7 +144,6 @@ function buildProfilePacket(){
     networks: (state.networks||[]).map(n=>({id:n.id,handle:n.handle})),
     contacts: contactUUIDs,
     broadcastData: Object.keys(extraData).length?extraData:undefined,
-    // Gossip : résumé des peers directs (max 20 pour limiter la taille du packet)
     _gossip:  gossipSnapshot.slice(0,20),
     ts:       Date.now(),
   };
@@ -134,75 +151,127 @@ function buildProfilePacket(){
 
 // ── HEARTBEAT ──────────────────────────────────────────────────────────────
 function broadcastPresence(){
-  if(!_ctx)return;
-  _ctx.send('social:presence',buildProfilePacket());
+  if(!_ctx){
+    _W('broadcastPresence — no ctx, skip');
+    return;
+  }
+  // FIX: vérification explicite de YM_P2P avec log
+  if(!window.YM_P2P){
+    _W('broadcastPresence — YM_P2P not ready yet (P2P connecting…)');
+    return;
+  }
+  const packet = buildProfilePacket();
+  _broadcastCount++;
+  _L(`broadcast #${_broadcastCount} | uuid=${packet.uuid?.slice(0,8)} | near=${_nearUsers.size} | gossip=${_gossipCache.size} | geo=${_myCoords?'✓':'✗'}`);
+  _ctx.send('social:presence', packet);
 }
+
 function startHeartbeat(){
   stopHeartbeat();
-  broadcastPresence();
-  _heartbeatTimer=setInterval(broadcastPresence,HEARTBEAT_INTERVAL);
+  _L('heartbeat start — interval', HEARTBEAT_INTERVAL, 'ms');
+  broadcastPresence(); // ping immédiat
+  _heartbeatTimer=setInterval(()=>{
+    broadcastPresence();
+  }, HEARTBEAT_INTERVAL);
 }
 function stopHeartbeat(){
-  if(_heartbeatTimer){clearInterval(_heartbeatTimer);_heartbeatTimer=null;}
+  if(_heartbeatTimer){clearInterval(_heartbeatTimer);_heartbeatTimer=null;_L('heartbeat stopped');}
+}
+
+// ── FIX: watcher YM_P2P — attend que P2P soit prêt avant de démarrer le heartbeat ──
+function _startP2PReadyWatcher(){
+  if(_p2pReadyInterval) return; // déjà en cours
+  _L('waiting for YM_P2P to become available…');
+
+  // Écoute l'event custom si app.js en dispatche un (optionnel)
+  const onReady = () => {
+    _L('ym:p2p-ready event received');
+    _stopP2PReadyWatcher();
+    startHeartbeat();
+  };
+  window.addEventListener('ym:p2p-ready', onReady, {once:true});
+
+  // Polling de secours toutes les 500ms pendant max 30s
+  let _elapsed = 0;
+  _p2pReadyInterval = setInterval(()=>{
+    _elapsed += 500;
+    if(window.YM_P2P){
+      _L(`YM_P2P detected after ${_elapsed}ms — starting heartbeat`);
+      _stopP2PReadyWatcher();
+      window.removeEventListener('ym:p2p-ready', onReady);
+      startHeartbeat();
+      return;
+    }
+    if(_elapsed >= 30000){
+      _W('YM_P2P not available after 30s — heartbeat will retry on next peer-join');
+      _stopP2PReadyWatcher();
+      window.removeEventListener('ym:p2p-ready', onReady);
+    }
+  }, 500);
+}
+function _stopP2PReadyWatcher(){
+  if(_p2pReadyInterval){clearInterval(_p2pReadyInterval);_p2pReadyInterval=null;}
 }
 
 // ── PRESENCE HANDLER ───────────────────────────────────────────────────────
 function handlePresence(data,peerId){
-  if(!data?.uuid)return;
+  if(!data?.uuid){
+    _W('handlePresence — packet without uuid, ignore');
+    return;
+  }
   const myUUID=_ctx?.loadProfile?.()?.uuid;
-  if(data.uuid===myUUID)return;
-
-  const ts=Date.now();
-  let isNear=false;
-  if(_myCoords&&data.lat&&data.lng){
-    isNear=haversine(_myCoords.lat,_myCoords.lng,data.lat,data.lng)<=NEAR_RADIUS;
-  }else{
-    isNear=true; // même room P2P = assez proche
+  if(data.uuid===myUUID){
+    // Loopback normal (on reçoit notre propre broadcast via relay)
+    return;
   }
 
-  // ── Gossip2 : traiter le résumé de ses peers ──────────────────────────
-  // Le packet contient _gossip = liste des peers que CE peer a vus directement.
-  // On les intègre dans notre cache comme "relay" (source=relay, relayedBy=data.uuid)
-  // On ne fait PAS de gossip2 des gossip2 (pas de cascade).
+  _receiveCount++;
+  const ts=Date.now();
+
+  // ── Calcul de la proximité ──────────────────────────────────────────────
+  let isNear=false;
+  let distStr='P2P-room';
+  if(_myCoords&&data.lat&&data.lng){
+    const dist=haversine(_myCoords.lat,_myCoords.lng,data.lat,data.lng);
+    isNear=dist<=NEAR_RADIUS;
+    distStr=`${dist.toFixed(0)}m`;
+    _L(`presence #${_receiveCount} from ${data.name||data.uuid?.slice(0,8)} | dist=${distStr} | near=${isNear} | peerId=${peerId?.slice(0,8)}`);
+  }else{
+    // Pas de coords → même room P2P = "near" par défaut
+    isNear=true;
+    _L(`presence #${_receiveCount} from ${data.name||data.uuid?.slice(0,8)} | no geo → near=true (P2P room) | peerId=${peerId?.slice(0,8)}`);
+  }
+
+  // ── Gossip2 : intégrer le résumé de ses peers ──────────────────────────
   if(Array.isArray(data._gossip)){
+    let gossip2Added=0;
     data._gossip.forEach(g=>{
       if(!g.uuid||g.uuid===myUUID)return;
-      // Ne pas écraser une entrée directe ou plus récente
       const existing=_gossipCache.get(g.uuid);
       if(existing&&existing.source==='direct')return;
       if(existing&&existing.ts>g.ts)return;
-      // Ne pas écraser un peer actuellement near
       if(_nearUsers.has(g.uuid))return;
-
       _gossipCache.set(g.uuid,{
-        profile:{
-          uuid:g.uuid,
-          name:g.name,
-          spheres:g.spheres||[],
-          broadcastData:g.broadcastData||null,
-          // Marqueur pour savoir que c'est un profil partiel
-          _partial:true,
-        },
-        ts:g.ts,
-        source:'relay',
-        relayedBy:data.uuid,
+        profile:{uuid:g.uuid,name:g.name,spheres:g.spheres||[],broadcastData:g.broadcastData||null,_partial:true},
+        ts:g.ts,source:'relay',relayedBy:data.uuid,
       });
+      gossip2Added++;
     });
+    if(gossip2Added>0) _L(`gossip2 from ${data.name||data.uuid?.slice(0,8)}: +${gossip2Added} relay entries`);
   }
 
   if(isNear){
     const wasNew=!_nearUsers.has(data.uuid);
-    // Enrichir le profil avec broadcastData si présent dans le packet
     const enrichedProfile=Object.assign({},data);
     if(data.broadcastData)enrichedProfile.broadcastData=data.broadcastData;
 
     _nearUsers.set(data.uuid,{profile:enrichedProfile,ts,peerId});
-    // Gossip direct : source=direct, profil complet
-    _gossipCache.set(data.uuid,{
-      profile:enrichedProfile,ts,source:'direct',relayedBy:null
-    });
+
+    // Gossip direct — profil complet
+    _gossipCache.set(data.uuid,{profile:enrichedProfile,ts,source:'direct',relayedBy:null});
 
     if(wasNew){
+      _L(`new near user: ${data.name||data.uuid?.slice(0,8)} (total near: ${_nearUsers.size})`);
       if(_ctx)_ctx.setNotification?.(_nearUsers.size);
       _incTabBadge('Near');
     }
@@ -224,23 +293,20 @@ function handlePresence(data,peerId){
       profile:Object.assign({},data,{broadcastData:data.broadcastData||null}),
       ts,source:'direct',relayedBy:null
     });
+    _L(`direct gossip (not near): ${data.name||data.uuid?.slice(0,8)} | dist=${distStr}`);
   }
 }
 
 // ── API PUBLIQUE POUR ACCÈS AU GOSSIP ──────────────────────────────────────
-// Permet à profile.js d'enrichir un profil avant affichage
 function getEnrichedProfile(uuid){
-  // Priorité: near > contact > gossip direct > gossip relay
   const near=_nearUsers.get(uuid);
   if(near)return near.profile;
   const contact=getContact(uuid);
   const gossip=_gossipCache.get(uuid);
   if(!gossip&&!contact)return null;
-  // Fusionner contact (données stables) + gossip (données fraîches)
   const base=contact?.profile||{};
   const fresh=gossip?.profile||{};
   const merged=Object.assign({},base,fresh);
-  // Prendre le broadcastData le plus récent
   if(fresh.broadcastData)merged.broadcastData=fresh.broadcastData;
   else if(base.broadcastData)merged.broadcastData=base.broadcastData;
   return merged;
@@ -249,13 +315,11 @@ function getEnrichedProfile(uuid){
 // ── CLEANUP ────────────────────────────────────────────────────────────────
 function cleanGossip(){
   const now=Date.now();
-  // Expirer le gossipCache
   let gossipChanged=false;
   for(const [uuid,entry] of _gossipCache){
     const ttl=entry.source==='relay'?GOSSIP2_TTL:GOSSIP_TTL;
     if(now-entry.ts>ttl){_gossipCache.delete(uuid);gossipChanged=true;}
   }
-  // Plafond mémoire : garder les GOSSIP_MAX_ENTRIES les plus récents
   if(_gossipCache.size>GOSSIP_MAX_ENTRIES){
     const sorted=[..._gossipCache.entries()].sort((a,b)=>b[1].ts-a[1].ts);
     _gossipCache=new Map(sorted.slice(0,GOSSIP_MAX_ENTRIES));
@@ -263,16 +327,16 @@ function cleanGossip(){
   }
   if(gossipChanged)_persistGossip();
 
-  // Expirer les nearUsers sans heartbeat
   let nearChanged=false;
+  let expired=[];
   for(const [uuid,entry] of _nearUsers){
     if(now-entry.ts>NEAR_TIMEOUT){
       _nearUsers.delete(uuid);
       nearChanged=true;
-      // Quand un peer near se déconnecte, son gossip direct reste valide
-      // jusqu'à GOSSIP_TTL — c'est le relay automatique
+      expired.push(uuid);
     }
   }
+  if(expired.length) _L(`near timeout — removed: ${expired.map(u=>u.slice(0,8)).join(', ')} | remaining near: ${_nearUsers.size}`);
   if(nearChanged){
     if(_ctx)_ctx.setNotification?.(_nearUsers.size||0);
     _refreshNear?.();
@@ -489,7 +553,7 @@ async function fetchFeedItems(networks){
           items.push({network:'Reddit',author:user,title:post.title,text:post.selftext?.slice(0,200)||'',image:img,ts:post.created_utc*1000,url:`https://reddit.com${post.permalink}`});
         });
       }
-    }catch{}
+    }catch(e){_W('feed fetch error for', n.id, ':', e.message);}
   }
   return items.sort((a,b)=>b.ts-a.ts);
 }
@@ -510,6 +574,7 @@ window.YM_S['social.sphere.js']={
   statuses:['online','away','busy'],
 
   async activate(ctx){
+    _L('activate — start');
     _ctx=ctx;
     _refreshNear=()=>{
       const panel=_getSocialPanel();
@@ -520,35 +585,73 @@ window.YM_S['social.sphere.js']={
       if(tab==='Near')renderNearTab(content);
     };
 
-    // Charger le gossip persisté
     _loadGossipFromStorage();
-
     startGeo();
-    startHeartbeat();
 
-    _onPeerJoin=()=>setTimeout(broadcastPresence,300);
+    // FIX: ne pas démarrer le heartbeat immédiatement si P2P pas prêt
+    if(window.YM_P2P){
+      _L('activate — YM_P2P already available, starting heartbeat immediately');
+      startHeartbeat();
+    } else {
+      _L('activate — YM_P2P not yet available, starting watcher');
+      _startP2PReadyWatcher();
+    }
+
+    // FIX: si un peer rejoint ET qu'on n'avait pas encore de heartbeat, démarrer
+    _onPeerJoin=(e)=>{
+      _L('peer-join event received:', e.detail?.peerId?.slice(0,8));
+      // Si heartbeat pas actif (P2P venait de devenir dispo), démarrer
+      if(!_heartbeatTimer){
+        if(window.YM_P2P){
+          _L('peer-join triggered heartbeat start');
+          startHeartbeat();
+        }
+      } else {
+        // Juste un broadcast de présence pour le nouveau peer
+        setTimeout(broadcastPresence, 300);
+      }
+    };
     window.addEventListener('ym:peer-join',_onPeerJoin);
 
     ctx.onReceive(async(type,data,peerId)=>{
-      if(type==='social:presence')handlePresence(data,peerId);
-      else if(type==='social:presence-req')broadcastPresence();
+      _L(`onReceive: type=${type} | from peerId=${peerId?.slice(0,8)}`);
+      if(type==='social:presence') handlePresence(data,peerId);
+      else if(type==='social:presence-req'){
+        _L('presence-req received — broadcasting back');
+        broadcastPresence();
+      }
     });
 
     _cleanTimer=setInterval(()=>{cleanGossip();_persistGossip();},5000);
 
-    _onVisibility=()=>{if(!document.hidden){startHeartbeat();broadcastPresence();}};
+    _onVisibility=()=>{
+      if(!document.hidden){
+        _L('page visible — broadcasting presence');
+        if(window.YM_P2P){
+          startHeartbeat(); // relance aussi le timer
+          broadcastPresence();
+        }
+      }
+    };
     document.addEventListener('visibilitychange',_onVisibility);
+
+    _L('activate — complete');
   },
 
   deactivate(){
-    stopGeo();stopHeartbeat();
+    _L('deactivate');
+    stopGeo();
+    stopHeartbeat();
+    _stopP2PReadyWatcher();
     if(_cleanTimer){clearInterval(_cleanTimer);_cleanTimer=null;}
     if(_onPeerJoin){window.removeEventListener('ym:peer-join',_onPeerJoin);_onPeerJoin=null;}
     if(_onVisibility){document.removeEventListener('visibilitychange',_onVisibility);_onVisibility=null;}
     window.YM_Call?.hangUp();
     _persistGossip();
     _nearUsers.clear();_gossipCache.clear();
+    _broadcastCount=0;_receiveCount=0;
     _ctx=null;
+    _L('deactivate — done');
   },
 
   renderPanel(container){
@@ -612,6 +715,7 @@ window.YM_S['social.sphere.js']={
       if(curIdx===0){const pane=track.children[0];renderNearTab(pane);}
     };
 
+    // FIX: affiche l'état P2P dans l'UI Near pour diagnostic
     container.appendChild(slider);
     container.appendChild(tabs);
     if(_ctx)_ctx.setNotification?.(0);
@@ -666,11 +770,8 @@ window.YM_S['social.sphere.js']={
 
   getTabBadges(){return{Near:_nearUsers.size,Feed:0,Search:0};},
 
-  // ── peerSection — FIX : conditionnel sur les sphères actives ──────────
   peerSection(container,ctx){
     const{uuid,isNear,isReciproc}=ctx;
-
-    // ── Fix: vérifier que call.sphere.js est réellement actif ──
     const hasCall=!!(window.YM_sphereRegistry&&window.YM_sphereRegistry.has('call.sphere.js'));
     const hasMsg=!!(window.YM_sphereRegistry&&window.YM_sphereRegistry.has('messenger.sphere.js'));
 
@@ -729,20 +830,23 @@ function renderNearTab(el){
   const near=[..._nearUsers.values()];
   const myUUID=_ctx?.loadProfile?.()?.uuid;
 
-  // Gossip direct (pas near, pas relay) — peers vus récemment
   const gossipDirect=[..._gossipCache.values()]
     .filter(g=>g.source==='direct'&&!_nearUsers.has(g.profile.uuid)&&g.profile.uuid!==myUUID)
     .slice(0,10);
-
-  // Gossip relay — profils vus par des peers, potentiellement hors-ligne
   const gossipRelay=[..._gossipCache.values()]
     .filter(g=>g.source==='relay'&&!_nearUsers.has(g.profile.uuid)&&g.profile.uuid!==myUUID)
     .slice(0,10);
 
+  // FIX: badge de statut P2P visible dans l'UI pour diagnostic
+  const p2pStatus = window.YM_P2P
+    ? `<span style="color:var(--green);font-size:10px">● P2P connected</span>`
+    : `<span style="color:#e84040;font-size:10px">● P2P connecting…</span>`;
+
   el.innerHTML=`
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
       <div style="font-size:10px;color:var(--text3)">Within ${NEAR_RADIUS}m · ${near.length} online</div>
       <div style="margin-left:auto;font-size:10px;color:var(--text3)">${_myCoords?'📍':'🌐'} ${_myCoords?(_myCoords.lat.toFixed(3)+','+_myCoords.lng.toFixed(3)):'P2P room'}</div>
+      ${p2pStatus}
     </div>`;
 
   if(!near.length){
@@ -943,7 +1047,6 @@ window.YM_Social={
   openProfile(uuid){
     const near=_nearUsers.get(uuid);
     const contact=getContact(uuid);
-    // Enrichir avec le gossip avant d'ouvrir
     const profile=getEnrichedProfile(uuid)||near?.profile||contact?.profile||{uuid,name:'Unknown'};
     window.YM?.openProfilePanel?.(profile);
   },
@@ -953,6 +1056,19 @@ window.YM_Social={
   get _contacts(){return loadContacts().map(c=>c.uuid);},
   getEnrichedProfile,
   broadcastPresence,
+  // FIX: diagnostic rapide accessible depuis la console
+  _diag(){
+    console.log('[Social] === DIAGNOSTIC ===');
+    console.log('[Social] YM_P2P:', window.YM_P2P ? `OK (cdn:${window.YM_P2P.cdn||'?'})` : 'NOT SET ⚠️');
+    console.log('[Social] heartbeat timer:', _heartbeatTimer ? 'running ✓' : 'stopped ⚠️');
+    console.log('[Social] p2pReadyWatcher:', _p2pReadyInterval ? 'running' : 'idle');
+    console.log('[Social] nearUsers:', _nearUsers.size);
+    console.log('[Social] gossipCache:', _gossipCache.size, '(direct:', [..._gossipCache.values()].filter(e=>e.source==='direct').length, ', relay:', [..._gossipCache.values()].filter(e=>e.source==='relay').length, ')');
+    console.log('[Social] broadcasts:', _broadcastCount, '| received:', _receiveCount);
+    console.log('[Social] myCoords:', _myCoords ? `lat=${_myCoords.lat?.toFixed(5)} lng=${_myCoords.lng?.toFixed(5)}` : 'none (geo off)');
+    console.log('[Social] ctx:', _ctx ? 'present ✓' : 'null ⚠️');
+    console.log('[Social] ====================');
+  },
 };
 
 // ── USER CARD ──────────────────────────────────────────────────────────────
