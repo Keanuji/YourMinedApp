@@ -2,6 +2,28 @@
   YourMine — Zone Theme
   Clean minimal dark. 4-button nav. Social sphere explorer.
 -->
+<!-- ── Auto-nettoyage (fix sans toucher à index.html) ───────────
+     index.html n'a jamais supprimé les <style>/DOM d'un thème
+     précédemment injecté. Ce script fait le ménage lui-même, dès
+     qu'il s'exécute — donc AVANT que ce thème n'ajoute ses propres
+     éléments (#ym-wp, #ym-bg, #nav-bar…), en supprimant :
+       1. tout <style> marqué d'un autre thème que "zone"
+       2. tout élément DOM aux mêmes IDs laissé par un thème précédent
+     Empêche les halos / le CSS de deux thèmes de se superposer. ─── -->
+<script>
+(function(){
+  document.querySelectorAll('style[data-ym-theme-style]').forEach(function(n){
+    if(n.getAttribute('data-ym-theme-style')!=='zone') n.remove();
+  });
+  ['ym-wp','ym-bg','ym-loader','toasts','desktop','drag-ghost','page-dots','nav-bar',
+   'folder-dlg','bg-dlg','panel-overlay','panel-spheres','panel-profile','panel-build',
+   'panel-mine','panel-sphere','panel-profile-view','ym-sign-dlg','panel-switcher',
+   'pwa-install-btn'].forEach(function(id){
+    var el=document.getElementById(id);
+    if(el) el.remove();
+  });
+})();
+</script>
 <script>
 window.YM_THEME_META = {"name":"Zone","icon":"◈","description":"Minimal social sphere explorer"};
 window.YM_WALLPAPER_PRESETS = [
@@ -41,7 +63,7 @@ window.YM_NAV_CONFIG = {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500&display=block" rel="stylesheet">
 
-<style>
+<style data-ym-theme-style="zone">
 :root{
   color-scheme:dark;
   --bg:#090c16;
@@ -64,14 +86,17 @@ body *{scrollbar-width:thin;scrollbar-color:rgba(91,120,245,.15) transparent}
 ::-webkit-scrollbar{width:2px}::-webkit-scrollbar-thumb{background:rgba(91,120,245,.2);border-radius:1px}
 
 #ym-wp{position:fixed;inset:0;z-index:0;background-size:cover;background-position:center}
-/* ── FIX fond simplifié ──────────────────────────────────────
-   Plus de double radial-gradient (::before/::after) : c'était la
-   source des halos visibles quand le CSS d'un autre thème restait
-   chargé en même temps. Simple aplat uni, sans risque de
-   superposition visuelle. */
+/* ── Fond à deux halos ────────────────────────────────────────
+   Design d'origine restauré : maintenant que index.html nettoie
+   correctement l'injection d'un thème avant d'en charger un autre
+   (voir cleanupPreviousTheme), il n'y a plus de risque que ces
+   halos se superposent à ceux d'un autre thème resté chargé par
+   erreur — donc plus besoin de rester minimaliste ici. */
 #ym-bg{position:fixed;inset:0;z-index:1;pointer-events:none;background:var(--bg)}
-#ym-bg::before,#ym-bg::after{display:none}
+#ym-bg::before{content:'';position:absolute;width:70%;height:50%;top:0;left:15%;background:radial-gradient(ellipse at 50% 0%,rgba(91,120,245,.07),transparent 80%)}
+#ym-bg::after{content:'';position:absolute;width:40%;height:35%;bottom:10%;right:-5%;background:radial-gradient(ellipse at 100% 100%,rgba(30,217,180,.05),transparent 70%)}
 body.has-wallpaper #ym-bg{background:transparent}
+body.has-wallpaper #ym-bg::before,body.has-wallpaper #ym-bg::after{opacity:.28}
 
 #desktop{position:fixed;top:0;left:0;right:0;bottom:calc(var(--dock-h) + var(--safe-b));z-index:10;overflow:hidden;touch-action:none}
 #desktop-slider{display:flex;height:100%;overflow:hidden;transition:transform .38s cubic-bezier(.4,0,.2,1);will-change:transform}
