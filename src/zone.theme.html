@@ -64,11 +64,14 @@ body *{scrollbar-width:thin;scrollbar-color:rgba(91,120,245,.15) transparent}
 ::-webkit-scrollbar{width:2px}::-webkit-scrollbar-thumb{background:rgba(91,120,245,.2);border-radius:1px}
 
 #ym-wp{position:fixed;inset:0;z-index:0;background-size:cover;background-position:center}
+/* ── FIX fond simplifié ──────────────────────────────────────
+   Plus de double radial-gradient (::before/::after) : c'était la
+   source des halos visibles quand le CSS d'un autre thème restait
+   chargé en même temps. Simple aplat uni, sans risque de
+   superposition visuelle. */
 #ym-bg{position:fixed;inset:0;z-index:1;pointer-events:none;background:var(--bg)}
-#ym-bg::before{content:'';position:absolute;width:70%;height:50%;top:0;left:15%;background:radial-gradient(ellipse at 50% 0%,rgba(91,120,245,.07),transparent 80%)}
-#ym-bg::after{content:'';position:absolute;width:40%;height:35%;bottom:10%;right:-5%;background:radial-gradient(ellipse at 100% 100%,rgba(30,217,180,.05),transparent 70%)}
+#ym-bg::before,#ym-bg::after{display:none}
 body.has-wallpaper #ym-bg{background:transparent}
-body.has-wallpaper #ym-bg::before,body.has-wallpaper #ym-bg::after{opacity:.28}
 
 #desktop{position:fixed;top:0;left:0;right:0;bottom:calc(var(--dock-h) + var(--safe-b));z-index:10;overflow:hidden;touch-action:none}
 #desktop-slider{display:flex;height:100%;overflow:hidden;transition:transform .38s cubic-bezier(.4,0,.2,1);will-change:transform}
@@ -142,7 +145,7 @@ body.has-wallpaper #nav-bar{background:rgba(0,0,0,.55)}
 
 #ym-edge-back{position:fixed;top:0;left:0;bottom:0;width:8px;z-index:500;cursor:pointer;display:none}
 #ym-edge-back-btn{position:fixed;top:50%;left:0;transform:translateY(-50%) translateX(-100%);z-index:501;background:var(--glass);border:1px solid rgba(91,120,245,.3);border-left:none;color:var(--accent);font-size:16px;padding:14px 8px;border-radius:0 10px 10px 0;cursor:pointer;transition:transform .22s cubic-bezier(.32,.72,0,1);backdrop-filter:var(--blur-mid);-webkit-backdrop-filter:var(--blur-mid);pointer-events:none;user-select:none}
-@media(hover:hover) and (pointer:fine){#ym-edge-back{display:block}#ym-edge-back:hover ~ #ym-edge-back-btn,#ym-edge-back-btn:hover{transform:translateY(-50%) translateX(0);pointer-events:all}}
+@media(hover:hover) and (pointer:fine){#ym-edge-back:hover ~ #ym-edge-back-btn,#ym-edge-back-btn:hover{transform:translateY(-50%) translateX(0);pointer-events:all}}
 
 .panel-handle{width:36px;height:3px;border-radius:2px;background:rgba(255,255,255,.1);margin:12px auto 2px;flex-shrink:0;cursor:grab}
 .panel-head{display:flex;align-items:center;padding:8px 20px 12px;gap:12px;border-bottom:1px solid rgba(255,255,255,.04);flex-shrink:0;min-height:46px;position:relative;z-index:2;cursor:pointer}
@@ -213,9 +216,6 @@ textarea.ym-input{resize:vertical;font-family:var(--font-m);font-size:12px}
 .formula-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:6px}
 .formula-var{background:rgba(255,255,255,.02);border-radius:6px;padding:6px 8px;font-size:10px;color:var(--text2);line-height:1.4}
 .formula-var b{color:var(--accent);font-family:var(--font-m)}
-body.has-wallpaper #ym-wp{animation:wpPan 120s linear infinite alternate}
-@keyframes wpPan{0%{background-position:0% center}100%{background-position:100% center}}
-
 #panel-switcher{position:fixed;left:0;right:0;bottom:calc(var(--dock-h) + var(--safe-b));max-height:calc(80dvh - var(--dock-h) - var(--safe-b));background:var(--glass);backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur);z-index:298;transform:translateY(calc(100% + 20px));transition:transform .38s cubic-bezier(.32,.72,0,1);display:flex;flex-direction:column;border-radius:24px 24px 0 0;overflow:hidden}
 #panel-switcher::before{content:'';position:absolute;top:0;left:12%;right:12%;height:1px;z-index:2;background:linear-gradient(90deg,transparent,rgba(91,120,245,.25) 30%,rgba(30,217,180,.15) 70%,transparent)}
 #panel-switcher.open{transform:translateY(0);z-index:303}
@@ -328,7 +328,7 @@ body.has-wallpaper #ym-wp{animation:wpPan 120s linear infinite alternate}
     // Fallback if app.js not yet loaded
     localStorage.setItem(TK,url);
     fetch(url).then(function(r){return r.ok?r.text():null;}).then(function(html){
-      if(html)try{localStorage.setItem(TC,html);}catch(e){}
+      if(html)try{localStorage.setItem(TC,html);localStorage.setItem('ym_theme_cache_for',url);}catch(e){}
       setTimeout(function(){location.reload();},100);
     }).catch(function(){setTimeout(function(){location.reload();},100);});
   }
@@ -424,7 +424,3 @@ body.has-wallpaper #ym-wp{animation:wpPan 120s linear infinite alternate}
   <div class="panel-handle" id="switcher-handle"></div>
   <div id="switcher-grid"></div>
 </div>
-
-<button id="pwa-install-btn">&#8595; Install</button>
-<div id="ym-edge-back"></div>
-<button id="ym-edge-back-btn" aria-label="Back">&#8249;</button>
