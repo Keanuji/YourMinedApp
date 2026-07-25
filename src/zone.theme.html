@@ -241,6 +241,8 @@ textarea.ym-input{resize:vertical;font-family:var(--font-m);font-size:12px}
 .formula-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:6px}
 .formula-var{background:rgba(255,255,255,.02);border-radius:6px;padding:6px 8px;font-size:10px;color:var(--text2);line-height:1.4}
 .formula-var b{color:var(--accent);font-family:var(--font-m)}
+body.has-wallpaper #ym-wp{animation:wpPan 120s linear infinite alternate}
+@keyframes wpPan{0%{background-position:0% center}100%{background-position:100% center}}
 #panel-switcher{position:fixed;left:0;right:0;bottom:calc(var(--dock-h) + var(--safe-b));max-height:calc(80dvh - var(--dock-h) - var(--safe-b));background:var(--glass);backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur);z-index:298;transform:translateY(calc(100% + 20px));transition:transform .38s cubic-bezier(.32,.72,0,1);display:flex;flex-direction:column;border-radius:24px 24px 0 0;overflow:hidden}
 #panel-switcher::before{content:'';position:absolute;top:0;left:12%;right:12%;height:1px;z-index:2;background:linear-gradient(90deg,transparent,rgba(91,120,245,.25) 30%,rgba(30,217,180,.15) 70%,transparent)}
 #panel-switcher.open{transform:translateY(0);z-index:303}
