@@ -535,7 +535,11 @@ function peerSection(container,peerCtx){
   const data=bd&&bd['radio.sphere.js'];
   // Forme réelle de peerCtx observée dans profile.js: {uuid, isNear, isReciproc, profile}
   const peerId=peerCtx&&peerCtx.uuid;
-  const peerName=(peerCtx&&peerCtx.profile&&peerCtx.profile.name)||'this user';
+  // FIX: si le pair n'a pas de nom (profil incomplet / gossip partiel), on affiche
+  // un extrait de son UUID plutôt qu'un générique "this user" — sinon deux pairs
+  // sans nom sont indiscernables dans la bannière/widget de clonage.
+  const peerName=(peerCtx&&peerCtx.profile&&peerCtx.profile.name)
+    ||(peerId?('User '+peerId.slice(0,6)):'this user');
 
   const wrap=document.createElement('div');
   wrap.style.cssText='display:flex;align-items:center;gap:10px';
