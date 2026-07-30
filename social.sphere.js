@@ -87,11 +87,16 @@ function buildProfilePacket(){
   const contactUUIDs=loadContacts().map(c=>c.uuid);
 
   // Broadcastdata des sphères actives
+  // FIX: window.YM_sphereRegistry est un Map — la clé (2e argument du forEach)
+  // est l'id réel de la sphère (ex: "radio.sphere.js"). `sphere._sphereId`
+  // n'existe sur AUCUN objet sphère et valait toujours undefined, ce qui
+  // faisait retomber toutes les sphères sous la même clé '' et s'écraser
+  // mutuellement dans extraData. On utilise donc directement sphereId.
   const extraData={};
   if(window.YM_sphereRegistry){
-    window.YM_sphereRegistry.forEach((sphere)=>{
+    window.YM_sphereRegistry.forEach((sphere,sphereId)=>{
       if(typeof sphere.broadcastData==='function'){
-        try{const d=sphere.broadcastData();if(d)Object.assign(extraData,{[sphere._sphereId||'']:d});}catch(e){}
+        try{const d=sphere.broadcastData();if(d)Object.assign(extraData,{[sphereId]:d});}catch(e){}
       }
     });
   }
