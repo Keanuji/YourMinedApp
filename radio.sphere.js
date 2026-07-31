@@ -103,16 +103,37 @@ function _myUuid(){
   return p&&p.uuid;
 }
 
-function play(station){
+function play(station,opts){
+  opts=opts||{};
   _curStation=station;
   const a=getAudio();a.src=station.url;a.volume=_vol;
-  a.play().catch(e=>{if(window.YM_toast)window.YM_toast('Stream error: '+e.message,'error');});
+  // UI optimiste : on affiche "en lecture" tout de suite, et on corrige
+  // silencieusement si le navigateur refuse (cf. catch ci-dessous).
   _playing=true;
   saveState({station,vol:_vol,playing:true});
   _updateMediaSession();_refreshWidget();_refreshPanel();
   // Broadcaster aux pairs via ctx — on inclut notre uuid pour que les clones puissent
   // identifier l'émetteur, quelle que soit la façon dont le transport livre l'expéditeur.
   if(_ctx&&_ctx.send){try{_ctx.send('radio:now',{uuid:_myUuid(),station:station.name,genre:station.genre,country:station.country});}catch(e){}}
+
+  const playPromise=a.play();
+  if(playPromise&&typeof playPromise.catch==='function'){
+    playPromise.catch(e=>{
+      // FIX: un NotAllowedError/AbortError ici signifie juste que le navigateur
+      // bloque l'autoplay sans geste utilisateur (typiquement la reprise
+      // automatique au chargement de page) — ce n'est PAS une vraie erreur de
+      // stream et ne doit jamais produire de toast disgracieux au démarrage.
+      const blockedByAutoplayPolicy = e && (e.name==='NotAllowedError'||e.name==='AbortError');
+      // Corriger l'état : la lecture n'a en réalité pas démarré
+      _playing=false;
+      saveState(Object.assign({},loadState(),{playing:false}));
+      _updateMediaSession();_refreshWidget();_refreshPanel();
+      if(_ctx&&_ctx.send){try{_ctx.send('radio:now',{uuid:_myUuid(),station:null});}catch(e2){}}
+      if(!opts.silent && !blockedByAutoplayPolicy && window.YM_toast){
+        window.YM_toast('Stream error: '+e.message,'error');
+      }
+    });
+  }
 }
 
 function stop(){
@@ -609,8 +630,11 @@ window.YM_S['radio.sphere.js']={
     if(st.station){
       _curStation=st.station;
       if(st.playing){
-        // Reprendre la lecture (la page était déjà en cours)
-        play(st.station);
+        // Reprendre la lecture (la page était déjà en cours) — silencieux :
+        // au chargement il n'y a pas encore de geste utilisateur, le navigateur
+        // bloque quasi systématiquement l'autoplay, ce n'est pas une vraie
+        // erreur à signaler ; l'utilisateur relancera d'un tap si besoin.
+        play(st.station,{silent:true});
       }
       // Sinon : station sélectionnée mais pas auto-play (pas de geste user)
     }else{
